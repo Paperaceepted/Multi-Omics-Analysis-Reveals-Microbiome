@@ -1,0 +1,557 @@
+suppressPackageStartupMessages({
+  library(microeco)
+  library(magrittr)
+  library(ggplot2)
+  library(Seurat)
+  library(survival)
+  library(ConsensusClusterPlus)
+  library(survminer)
+  library(ggradar)
+  library(ggtree)
+  library(dplyr)
+})
+
+theme_set(theme_bw())
+dir.create("results", showWarnings = FALSE)
+
+# Color palettes
+COLOR_PALETTES <- list(
+  standard = c("#1E466E", "#376795", "#528FD5", "#72BCD5", "#AADCE0", "#FFE6B7", "#FFD06F", "#F7AA58", "#EF8A47", "#E76254"),
+  alternative = c("#253494", "#2C7FB8", "#41B6C4", "#7FCDBB", "#C7E9B4", "#FFFFCC"),
+  cluster = c("#E64B35FF", "#4DBBD5FF", "#00A087FF")
+)
+
+# Function to load and preprocess species data
+load_species_data <- function(species_path, cluster_path, filter_species = NULL) {
+  # Load species data
+  bacteria_species <- read.csv(species_path, header = TRUE, row.names = 1)
+  bacteria_species <- subset(bacteria_species, select = -cancertype)
+  
+  # Load cluster information
+  group_data <- read.delim(cluster_path, header = TRUE, stringsAsFactors = FALSE)
+  
+  # Apply species filtering if provided
+  if (!is.null(filter_species)) {
+    bacteria_species <- bacteria_species[, colnames(bacteria_species) %in% filter_species]
+  }
+  
+  # Calculate species abundance
+  species_sums <- colSums(bacteria_species)
+  nonzero_species <- names(species_sums)[species_sums > 0]
+  bacteria_species_nonzero <- bacteria_species[, nonzero_species]
+  species_rel <- sweep(bacteria_species_nonzero, 1, rowSums(bacteria_species_nonzero), FUN = "/")
+  
+  # Filter by samples with cluster information
+  tumor_samples_filtered <- intersect(rownames(species_rel), group_data$ID)
+  species_rel_tumor <- species_rel[tumor_samples_filtered, ]
+  
+  # Create sample table
+  sample_table <- data.frame(
+    Group = group_data$Group[match(rownames(species_rel_tumor), group_data$ID)],
+    row.names = rownames(species_rel_tumor)
+  )
+  
+  # Count samples per group
+  group_counts <- table(sample_table$Group)
+  
+  # Create taxonomy table
+  tax_table <- data.frame(
+    Species = colnames(species_rel_tumor),
+    row.names = colnames(species_rel_tumor)
+  )
+  
+  # Create microeco dataset
+  species_rel_tumor_t <- as.data.frame(t(species_rel_tumor))
+  dataset <- microtable$new(
+    sample_table = sample_table,
+    otu_table = species_rel_tumor_t,
+    tax_table = tax_table
+  )
+  
+  # Store group counts as attribute
+  attr(dataset, "group_counts") <- group_counts
+  
+  return(dataset)
+}
+
+# Function to analyze alpha diversity
+analyze_alpha_diversity <- function(dataset, output_prefix = "species", metrics = c("Shannon", "Simpson", "InvSimpson", "Pielou")) {
+  # Calculate alpha diversity
+  dataset$cal_alphadiv(PD = FALSE)
+  dataset$save_alphadiv(dirpath = paste0(output_prefix, "_alpha_diversity"))
+  
+  # Create alpha transformer object
+  alpha_transformer <- trans_alpha$new(dataset = dataset, group = "Group")
+  
+  # Calculate differences
+  alpha_transformer$cal_diff(method = "KW")
+  
+  # Generate plots for each metric
+  results <- list()
+  
+  for (metric in metrics) {
+    p <- alpha_transformer$plot_alpha(pair_compare = TRUE, measure = metric) + theme_test()
+    ggsave(
+      file.path("results", paste0(output_prefix, "_Alpha_diversity_", metric, "_boxplot.pdf")),
+      p, width = 6, height = 5
+    )
+    
+    results[[metric]] <- list(
+      p_value = alpha_transformer$res_diff[alpha_transformer$res_diff$Measure == metric, "P.adj"],
+      plot = p
+    )
+  }
+  
+  return(list(
+    transformer = alpha_transformer,
+    results = results
+  ))
+}
+
+# Function to analyze beta diversity
+analyze_beta_diversity <- function(dataset, output_prefix = "species", methods = c("PCoA", "NMDS"), measures = c("bray", "jaccard")) {
+  # Calculate beta diversity
+  dataset$cal_betadiv(unifrac = FALSE)
+  dataset$save_betadiv(dirpath = paste0(output_prefix, "_beta_diversity"))
+  
+  results <- list()
+  
+  for (measure in measures) {
+    for (method in methods) {
+      # Create beta transformer object
+      beta_transformer <- trans_beta$new(
+        dataset = dataset, 
+        group = "Group", 
+        measure = measure
+      )
+      
+      # Calculate ordination
+      beta_transformer$cal_ordination(method = method)
+      
+      # Generate plot
+      p <- beta_transformer$plot_ordination(
+        plot_color = "Group", 
+        plot_shape = "Group", 
+        plot_type = c("point", "ellipse")
+      ) + theme_test()
+      
+      ggsave(
+        file.path("results", paste0(output_prefix, "_Beta_diversity_", method, "_", measure, ".pdf")),
+        p, width = 7, height = 5
+      )
+      
+      results[[paste(measure, method, sep = "_")]] <- list(
+        transformer = beta_transformer,
+        plot = p
+      )
+    }
+  }
+  
+  return(results)
+}
+
+# Function to visualize abundance data
+visualize_abundance <- function(dataset, output_prefix = "species", ntaxa = 10, 
+                               color_palette = COLOR_PALETTES$standard) {
+  # Get group counts
+  group_counts <- attr(dataset, "group_counts")
+  group_labels <- sapply(names(group_counts), function(group) {
+    paste0(group, " (n=", group_counts[group], ")")
+  })
+  
+  # Sample-level community composition
+  t1 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = ntaxa)
+  p1 <- t1$plot_bar(
+    others_color = "grey70", 
+    facet = "Group", 
+    xtext_keep = FALSE, 
+    legend_text_italic = FALSE
+  ) + scale_fill_manual(values = colorRampPalette(rev(color_palette))(ntaxa + 1))
+  
+  ggsave(
+    file.path("results", paste0(output_prefix, "_community_composition.pdf")),
+    p1, width = 9, height = 4
+  )
+  
+  # Group mean bar plot
+  t2 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = ntaxa, groupmean = "Group")
+  p2 <- t2$plot_bar(
+    others_color = "grey70", 
+    legend_text_italic = FALSE
+  ) + 
+    scale_fill_manual(values = colorRampPalette(rev(color_palette))(ntaxa + 1)) +
+    theme_classic() +
+    scale_x_discrete(labels = group_labels) +
+    theme(
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black")
+    )
+  
+  ggsave(
+    file.path("results", paste0(output_prefix, "_group_mean_bars.pdf")),
+    p2, width = 5.1, height = 4
+  )
+  
+  # Pie charts
+  t3 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = ntaxa, groupmean = "Group")
+  p3 <- t3$plot_pie(
+    facet_nrow = 2, 
+    add_label = TRUE
+  ) + scale_fill_manual(values = colorRampPalette(rev(color_palette))(ntaxa + 1))
+  
+  ggsave(
+    file.path("results", paste0(output_prefix, "_group_mean_pie.pdf")),
+    p3, width = 8, height = 8
+  )
+  
+  # Donut charts
+  t4 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = ntaxa, groupmean = "Group")
+  p4 <- t4$plot_donut(label = TRUE)
+  
+  ggsave(
+    file.path("results", paste0(output_prefix, "_group_mean_donut.pdf")),
+    p4, width = 10, height = 8
+  )
+  
+  # Radar charts (if at least 2 groups)
+  if (length(group_counts) >= 2) {
+    t5 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = ntaxa, groupmean = "Group")
+    p5 <- t5$plot_radar(
+      values.radar = c("0%", "25%", "50%", "75%", "100%"), 
+      grid.min = 0, 
+      grid.mid = 0.25, 
+      grid.max = 0.5
+    )
+    
+    ggsave(
+      file.path("results", paste0(output_prefix, "_group_mean_radar.pdf")),
+      p5, width = 8, height = 6
+    )
+  }
+  
+  # Ternary plot (if exactly 3 groups)
+  if (length(group_counts) == 3) {
+    t6 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = 8, groupmean = "Group")
+    p6 <- t6$plot_tern() + scale_fill_manual(values = colorRampPalette(rev(color_palette))(8 + 1))
+    
+    ggsave(
+      file.path("results", paste0(output_prefix, "_group_mean_ternary.pdf")),
+      p6, width = 8, height = 6
+    )
+  }
+  
+  # Alluvial diagram
+  t7 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = ntaxa)
+  p7 <- t7$plot_bar(
+    use_alluvium = TRUE, 
+    clustering = TRUE, 
+    facet = "Group", 
+    xtext_type_hor = FALSE, 
+    xtext_keep = FALSE, 
+    xtext_size = 6
+  ) + scale_fill_manual(values = colorRampPalette(rev(color_palette))(ntaxa + 1))
+  
+  ggsave(
+    file.path("results", paste0(output_prefix, "_alluvial.pdf")),
+    p7, width = 9, height = 4
+  )
+  
+  # Boxplots
+  t8 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = ntaxa)
+  p8 <- t8$plot_box(
+    group = "Group", 
+    xtext_angle = 45
+  ) + theme_test()
+  
+  ggsave(
+    file.path("results", paste0(output_prefix, "_boxplot.pdf")),
+    p8, width = 10, height = 4
+  )
+  
+  # Heatmap
+  t9 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = 30)
+  p9 <- t9$plot_heatmap(
+    facet = "Group", 
+    xtext_keep = FALSE, 
+    withmargin = FALSE, 
+    plot_breaks = c(0.01, 0.1, 1, 10)
+  )
+  
+  ggsave(
+    file.path("results", paste0(output_prefix, "_heatmap.pdf")),
+    p9, width = 7, height = 5
+  )
+  
+  return(list(
+    transformers = list(t1, t2, t3, t4, t7, t8, t9),
+    plots = list(p1, p2, p3, p4, p7, p8, p9)
+  ))
+}
+
+# Function to analyze Venn relationships
+analyze_venn <- function(dataset, output_prefix = "species") {
+  # Merge samples by group
+  dataset_merged <- dataset$merge_samples(use_group = "Group")
+  
+  # Create Venn diagram
+  venn_transformer <- trans_venn$new(dataset_merged, ratio = "seqratio")
+  p <- venn_transformer$plot_venn()
+  
+  ggsave(
+    file.path("results", paste0(output_prefix, "_venn_diagram.pdf")),
+    p, width = 6, height = 5
+  )
+  
+  return(list(
+    transformer = venn_transformer,
+    plot = p
+  ))
+}
+
+# Function to perform differential abundance analysis
+analyze_differential_abundance <- function(dataset, output_prefix = "species", 
+                                         group_order = NULL, alpha = 0.05, 
+                                         p_adjust_method = "none", 
+                                         filter_taxa_threshold = 0.0001) {
+  # Get group names if not provided
+  if (is.null(group_order)) {
+    group_order <- levels(factor(dataset$sample_table$Group))
+  }
+  
+  # Create differential abundance transformer
+  diff_transformer <- trans_diff$new(
+    dataset = dataset, 
+    method = "lefse", 
+    group = "Group", 
+    alpha = alpha, 
+    lefse_subgroup = NULL,
+    p_adjust_method = p_adjust_method
+  )
+  
+  # Generate bar plot showing differences
+  p1 <- diff_transformer$plot_diff_bar(
+    use_number = 1:20, 
+    width = 0.8, 
+    group_order = group_order
+  ) + 
+    theme_bw() + 
+    scale_fill_manual(values = COLOR_PALETTES$cluster[1:length(group_order)]) + 
+    geom_bar(stat = "identity", colour = "black", width = 0.8)
+  
+  ggsave(
+    file.path("results", paste0(output_prefix, "_differential_barplot.pdf")),
+    p1, width = 6, height = 5
+  )
+  
+  # Generate abundance plot with significance
+  p2 <- diff_transformer$plot_diff_abund(
+    use_number = 1:20, 
+    add_sig = TRUE, 
+    group_order = group_order,
+    coord_flip = TRUE
+  ) + 
+    theme_test() + 
+    scale_fill_manual(values = COLOR_PALETTES$cluster[1:length(group_order)])
+  
+  ggsave(
+    file.path("results", paste0(output_prefix, "_differential_abundance.pdf")),
+    p2, width = 6, height = 5
+  )
+  
+  # Generate cladogram
+  p3 <- diff_transformer$plot_diff_cladogram(
+    filter_taxa = filter_taxa_threshold,
+    use_taxa_num = 100, 
+    use_feature_num = ifelse(length(group_order) <= 2, 10, 20), 
+    clade_label_level = 6, 
+    group_order = group_order
+  )
+  
+  ggsave(
+    file.path("results", paste0(output_prefix, "_differential_cladogram.pdf")),
+    p3, width = 8, height = 6
+  )
+  
+  # Extract and save differential abundance results
+  lefse_diff <- diff_transformer$res_diff
+  lefse_all_diff <- lefse_diff[lefse_diff$P.unadj < alpha, ]
+  lefse_sig_diff <- lefse_diff[lefse_diff$P.unadj < alpha & lefse_diff$LDA > 2, ]
+  
+  write.csv(
+    lefse_diff, 
+    file.path("results", paste0(output_prefix, "_lefse_all_features.csv"))
+  )
+  
+  write.csv(
+    lefse_all_diff, 
+    file.path("results", paste0(output_prefix, "_lefse_significant_p", alpha, ".csv"))
+  )
+  
+  write.csv(
+    lefse_sig_diff, 
+    file.path("results", paste0(output_prefix, "_lefse_significant_p", alpha, "_lda2.csv"))
+  )
+  
+  return(list(
+    transformer = diff_transformer,
+    plots = list(barplot = p1, abundance = p2, cladogram = p3),
+    results = list(all = lefse_diff, significant_p = lefse_all_diff, significant_lda = lefse_sig_diff)
+  ))
+}
+
+# Main function to run all analyses
+run_all_analyses <- function(species_path, cluster_path, output_prefix = "species",
+                            alpha_metrics = c("Shannon", "Simpson", "InvSimpson", "Pielou"),
+                            filter_species = NULL, color_palette = COLOR_PALETTES$standard) {
+  # Load and process data
+  dataset <- load_species_data(species_path, cluster_path, filter_species)
+  
+  # Run all analyses
+  alpha_results <- analyze_alpha_diversity(dataset, output_prefix, alpha_metrics)
+  beta_results <- analyze_beta_diversity(dataset, output_prefix)
+  abundance_results <- visualize_abundance(dataset, output_prefix, color_palette = color_palette)
+  venn_results <- analyze_venn(dataset, output_prefix)
+  diff_results <- analyze_differential_abundance(dataset, output_prefix)
+  
+  return(list(
+    dataset = dataset,
+    alpha = alpha_results,
+    beta = beta_results,
+    abundance = abundance_results,
+    venn = venn_results,
+    differential = diff_results
+  ))
+}
+
+# Function to generate report summary
+generate_report_summary <- function(all_results, output_prefix = "species") {
+  # Extract results
+  dataset <- all_results$dataset
+  alpha_results <- all_results$alpha
+  diff_results <- all_results$differential
+  
+  # Create summary data frame
+  group_counts <- attr(dataset, "group_counts")
+  
+  alpha_summary <- data.frame(
+    Metric = character(),
+    P_value = numeric(),
+    Significant = logical(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (metric_name in names(alpha_results$results)) {
+    metric_result <- alpha_results$results[[metric_name]]
+    alpha_summary <- rbind(
+      alpha_summary,
+      data.frame(
+        Metric = metric_name,
+        P_value = metric_result$p_value,
+        Significant = metric_result$p_value < 0.05,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+  
+  diff_summary <- data.frame(
+    Total_features = nrow(diff_results$results$all),
+    Significant_features_p = nrow(diff_results$results$significant_p),
+    Significant_features_lda = nrow(diff_results$results$significant_lda)
+  )
+  
+  # Write summary report
+  report_file <- file.path("results", paste0(output_prefix, "_analysis_summary.txt"))
+  
+  sink(report_file)
+  
+  cat("===== MICROBIOME CLUSTER ANALYSIS SUMMARY =====\n\n")
+  
+  cat("Dataset Information:\n")
+  cat("  Total samples:", nrow(dataset$sample_table), "\n")
+  cat("  Total species:", ncol(dataset$otu_table), "\n\n")
+  
+  cat("Group distribution:\n")
+  for (group in names(group_counts)) {
+    cat("  ", group, ":", group_counts[group], "samples\n")
+  }
+  cat("\n")
+  
+  cat("Alpha Diversity Results:\n")
+  for (i in 1:nrow(alpha_summary)) {
+    cat("  ", alpha_summary$Metric[i], ": p-value =", 
+        format(alpha_summary$P_value[i], digits = 4),
+        ifelse(alpha_summary$Significant[i], " (significant)", ""), "\n")
+  }
+  cat("\n")
+  
+  cat("Differential Abundance Results:\n")
+  cat("  Total features analyzed:", diff_summary$Total_features, "\n")
+  cat("  Features with p <", 0.05, ":", diff_summary$Significant_features_p, "\n")
+  cat("  Features with p <", 0.05, "and LDA > 2:", diff_summary$Significant_features_lda, "\n")
+  cat("\n")
+  
+  cat("Top differential species:\n")
+  top_species <- diff_results$results$significant_lda
+  if (nrow(top_species) > 0) {
+    top_species <- top_species[order(-top_species$LDA), ]
+    for (i in 1:min(5, nrow(top_species))) {
+      cat("  ", i, ". ", top_species$Taxa[i], " (Group: ", top_species$Group[i],
+          ", LDA: ", format(top_species$LDA[i], digits = 4), ")\n", sep = "")
+    }
+  } else {
+    cat("  No significant species with LDA > 2 found\n")
+  }
+  
+  sink()
+  
+  return(list(
+    alpha_summary = alpha_summary,
+    diff_summary = diff_summary
+  ))
+}
+
+# Function to run analysis on both all species and significant species
+run_comprehensive_analysis <- function(species_path, all_species_cluster_path, 
+                                     significant_species_path = NULL, 
+                                     significant_species_cluster_path = NULL) {
+  # Analysis for all species
+  all_species_results <- run_all_analyses(
+    species_path = species_path,
+    cluster_path = all_species_cluster_path,
+    output_prefix = "all_species",
+    color_palette = COLOR_PALETTES$standard
+  )
+  
+  generate_report_summary(all_species_results, "all_species")
+  
+  # Analysis for significant species if provided
+  if (!is.null(significant_species_path) && !is.null(significant_species_cluster_path)) {
+    significant_species_results <- run_all_analyses(
+      species_path = significant_species_path,
+      cluster_path = significant_species_cluster_path,
+      output_prefix = "significant_species",
+      color_palette = COLOR_PALETTES$alternative
+    )
+    
+    generate_report_summary(significant_species_results, "significant_species")
+    
+    return(list(
+      all_species = all_species_results,
+      significant_species = significant_species_results
+    ))
+  }
+  
+  return(list(
+    all_species = all_species_results
+  ))
+}
+
+# Execute analysis if running script directly
+if (interactive()) {
+  results <- run_comprehensive_analysis(
+    species_path = "data/ESCA_otutable_bacteria_species.csv",
+    all_species_cluster_path = "data/tcga.clust.txt",
+    significant_species_path = "data/bacteria_species_sig_diff.csv", 
+    significant_species_cluster_path = "data/BacteriaCluster_Prognostic_P_0.05.txt"
+  )
+}
