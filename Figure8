@@ -1,0 +1,475 @@
+suppressPackageStartupMessages({
+  library(maftools)
+  library(ggpubr)
+  library(dplyr)
+  library(stringr)
+  library(RColorBrewer)
+  library(reshape2)
+  library(igraph)
+  library(ggraph)
+  library(ggplot2)
+  library(cowplot)
+})
+
+dir.create("results", showWarnings = FALSE)
+
+# Color palettes for visualizations
+COLOR_PALETTES <- list(
+  network_standard = c("#1F66AC", "#75AFD3", "grey90", "#FAB99B", "#B2192B"),
+  network_alternative = c("#006837", "#66BD63", "#D9EF8B", "#FEE08B", "#F46D43", "#A50026"),
+  node_types = c("Bacteria" = "lightblue", "Cell" = "lightpink"),
+  correlation_positive = rev(brewer.pal(9, 'Reds'))[1:5],
+  correlation_negative = rev(brewer.pal(9, 'YlGnBu'))[5:8],
+  significance = c("ns" = "#E8E8E8")
+)
+
+# Function to load and preprocess data
+load_multiomics_data <- function(bacteria_path, cluster_path, immunecell_path = NULL, 
+                               pathway_path = NULL, tmb_path = NULL, selected_bacteria = NULL, 
+                               selected_immunecells = NULL) {
+  # Load bacterial data
+  bacteria_species <- read.csv(bacteria_path, header = TRUE, row.names = 1)
+  bacteria_species <- subset(bacteria_species, select = -cancertype)
+  
+  # Load clustering information
+  clusters <- read.delim(cluster_path, header = TRUE, stringsAsFactors = FALSE)
+  sample_names <- clusters[, 1]
+  
+  # Filter bacterial data by samples in clustering
+  bacteria_species <- bacteria_species[rownames(bacteria_species) %in% sample_names, ]
+  
+  # Filter specific bacteria if provided
+  if(!is.null(selected_bacteria)) {
+    bacteria_species <- bacteria_species[, colnames(bacteria_species) %in% selected_bacteria]
+  }
+  
+  # Calculate relative abundance
+  species_rel <- sweep(bacteria_species, 1, rowSums(bacteria_species), FUN = "/")
+  
+  # Create result list
+  result <- list(
+    bacteria = species_rel,
+    clusters = clusters
+  )
+  
+  # Load immune cell data if provided
+  if(!is.null(immunecell_path)) {
+    immune_cells <- read.csv(immunecell_path, header = TRUE, stringsAsFactors = FALSE)
+    
+    # Filter immune cells if specified
+    if(!is.null(selected_immunecells)) {
+      immune_cells <- immune_cells[, colnames(immune_cells) %in% c("ID", selected_immunecells)]
+    }
+    
+    result$immune_cells <- immune_cells
+  }
+  
+  # Load pathway data if provided
+  if(!is.null(pathway_path)) {
+    pathways <- read.csv(pathway_path, header = TRUE, stringsAsFactors = FALSE, 
+                        check.names = FALSE, row.names = 1)
+    result$pathways <- pathways
+  }
+  
+  # Load TMB data if provided
+  if(!is.null(tmb_path)) {
+    # Load mutation data
+    maf <- read.maf(tmb_path)
+    
+    # Get clinical data
+    clinical <- getClinicalData(maf)
+    clinical$Sample_ID_Short <- substr(clinical$Tumor_Sample_Barcode, 1, 15)
+    
+    # Add cluster information
+    clinical$Group <- clusters$Group[match(clinical$Sample_ID_Short, clusters$ID)]
+    clinical <- clinical %>% na.omit() %>% arrange(Group)
+    
+    # Update MAF clinical data
+    maf@clinical.data <- clinical
+    
+    # Filter MAF to include only samples with group assignment
+    maf_grouped <- subsetMaf(maf, tsb = clinical$Tumor_Sample_Barcode[!is.na(clinical$Group)])
+    
+    # Calculate TMB
+    tmb_data <- tmb(maf_grouped, captureSize = 50, logScale = TRUE)
+    tmb_processed <- tmb_data %>%
+      mutate(ID = str_sub(Tumor_Sample_Barcode, 1, 15)) %>%
+      select(ID, total, total_perMB, total_perMB_log)
+    
+    result$tmb <- tmb_processed
+    result$maf <- maf_grouped
+  }
+  
+  return(result)
+}
+
+# Function to create correlation network between bacteria and immune cells
+create_correlation_network <- function(bacteria_data, immune_data, correlation_method = "spearman",
+                                     filter_type = "none", filter_threshold = 0, 
+                                     layout_type = "circle", node_size = 10,
+                                     output_file = NULL, width = 10, height = 10) {
+  # Find common samples
+  common_samples <- intersect(rownames(bacteria_data), immune_data$ID)
+  bacteria_filtered <- bacteria_data[common_samples, ]
+  immune_filtered <- immune_data[immune_data$ID %in% common_samples, ]
+  
+  # Combine data for correlation
+  combined_data <- cbind(bacteria_filtered, immune_filtered[, -1])
+  
+  # Calculate correlation matrix
+  cor_matrix <- cor(combined_data, method = correlation_method)
+  
+  # Apply filtering based on filter_type
+  adj_matrix <- as.matrix(cor_matrix)
+  
+  if(filter_type == "bacteria_cell_only") {
+    # Zero out bacteria-bacteria and cell-cell correlations
+    num_bacteria <- ncol(bacteria_filtered)
+    num_cells <- ncol(immune_filtered) - 1
+    adj_matrix[1:num_bacteria, 1:num_bacteria] <- 0
+    adj_matrix[(num_bacteria+1):(num_bacteria+num_cells), (num_bacteria+1):(num_bacteria+num_cells)] <- 0
+  } else if(filter_type == "threshold") {
+    # Apply correlation threshold
+    adj_matrix[abs(adj_matrix) < filter_threshold] <- 0
+  }
+  
+  # Create graph
+  graph <- graph_from_adjacency_matrix(adj_matrix, weighted = TRUE, 
+                                     mode = "undirected", diag = FALSE)
+  
+  # Set node attributes
+  V(graph)$type <- ifelse(V(graph)$name %in% colnames(bacteria_filtered), 
+                         "Bacteria", "Cell")
+  V(graph)$size <- node_size
+  
+  # Set edge attributes if needed
+  if(filter_type == "bacteria_cell_only") {
+    E(graph)$weight <- E(graph)$weight * 2  # Enhance edge width for visibility
+  }
+  
+  # Create ggraph plot
+  p <- ggraph(graph, layout = layout_type) +
+    geom_edge_link(aes(edge_width = abs(weight), color = weight), alpha = 1) +
+    scale_edge_width(range = c(0.1, 2)) +
+    scale_edge_color_gradientn(
+      colors = if(filter_type == "bacteria_cell_only") 
+        COLOR_PALETTES$network_alternative else COLOR_PALETTES$network_standard,
+      limits = c(-1, 1)
+    ) +
+    geom_node_point(aes(color = type), size = node_size) +
+    scale_color_manual(values = COLOR_PALETTES$node_types, name = "Node Type") +
+    geom_node_text(aes(label = name), repel = TRUE, size = 5) +
+    theme_void() +
+    theme(
+      legend.position = "bottom",
+      legend.box = "horizontal",
+      legend.margin = margin(t = 10)
+    )
+  
+  # Save plot if output file is provided
+  if(!is.null(output_file)) {
+    ggsave(output_file, p, width = width, height = height)
+  }
+  
+  return(list(
+    graph = graph,
+    plot = p,
+    correlation_matrix = cor_matrix
+  ))
+}
+
+# Function to calculate correlations between bacteria and immune cells/pathways with statistics
+calculate_correlations <- function(data_x, data_y, x_names = NULL, y_names = NULL,
+                                 correlation_method = "spearman", adjustment_method = "BH",
+                                 is_pathway = FALSE, output_file = NULL) {
+  # Prepare variables to correlate
+  if(is.null(x_names)) {
+    x_names <- colnames(data_x)
+  }
+  
+  if(is_pathway) {
+    # For pathway data, y_names are row names
+    if(is.null(y_names)) {
+      y_names <- rownames(data_y)
+    }
+  } else {
+    # For immune cell data, y_names are column names excluding ID
+    if(is.null(y_names)) {
+      y_names <- setdiff(colnames(data_y), "ID")
+    }
+  }
+  
+  # Initialize results dataframe
+  results <- data.frame(
+    X_Variable = character(),
+    Y_Variable = character(),
+    Correlation = numeric(),
+    P_value = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Calculate correlations
+  for(x_var in x_names) {
+    for(y_var in y_names) {
+      # Extract data
+      if(is_pathway) {
+        data_y_values <- as.numeric(data_y[y_var, ])
+      } else {
+        # Find common samples
+        common_samples <- intersect(rownames(data_x), data_y$ID)
+        data_x_values <- as.numeric(data_x[common_samples, x_var])
+        data_y_values <- as.numeric(data_y[data_y$ID %in% common_samples, y_var])
+      }
+      
+      data_x_values <- as.numeric(data_x[, x_var])
+      
+      # Perform correlation test
+      cor_test <- cor.test(data_x_values, data_y_values, method = correlation_method)
+      
+      # Add to results
+      results <- rbind(results, data.frame(
+        X_Variable = x_var,
+        Y_Variable = y_var,
+        Correlation = cor_test$estimate,
+        P_value = cor_test$p.value,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  # Process variable names
+  if(grepl("^s__", results$X_Variable[1])) {
+    results$X_Variable <- gsub("^s__", "", results$X_Variable)
+  }
+  
+  if(is_pathway && !grepl("^HALLMARK_", results$Y_Variable[1])) {
+    results$Y_Variable <- paste0("HALLMARK_", results$Y_Variable)
+  }
+  
+  # Calculate adjusted p-values
+  results$FDR <- p.adjust(results$P_value, method = adjustment_method)
+  
+  # Add significance labels
+  results$Significance <- ifelse(results$P_value < 0.001, "***",
+                               ifelse(results$P_value < 0.01, "**",
+                                    ifelse(results$P_value < 0.05, "*", "ns")))
+  
+  # Sort by p-value
+  results <- results[order(results$P_value), ]
+  
+  # Save results if output file is provided
+  if(!is.null(output_file)) {
+    write.csv(results, output_file, row.names = FALSE)
+    
+    # Also save significant results
+    significant_results <- results[results$P_value < 0.05, ]
+    if(nrow(significant_results) > 0) {
+      write.csv(significant_results, 
+               gsub("\\.csv$", "_significant.csv", output_file), 
+               row.names = FALSE)
+    }
+  }
+  
+  return(results)
+}
+
+# Function to create correlation bubble plot for bacteria and pathways
+create_correlation_bubbleplot <- function(correlation_results, x_col = "X_Variable", 
+                                        y_col = "Y_Variable", cor_col = "Correlation",
+                                        pval_col = "P_value", output_file = NULL,
+                                        width = 10, height = 15) {
+  # Copy data to avoid modifying the original
+  plot_data <- correlation_results
+  
+  # Add grouping for legend
+  plot_data$fdr_group <- ifelse(plot_data[[pval_col]] < 0.001, "q < 0.001",
+                             ifelse(plot_data[[pval_col]] < 0.01, "q < 0.01",
+                                  ifelse(plot_data[[pval_col]] < 0.05, "q < 0.05",
+                                       ifelse(plot_data[[pval_col]] < 0.1, "q < 0.1", 
+                                            "q > 0.1"))))
+  plot_data$fdr_group_2 <- plot_data$fdr_group
+  
+  # Create bubble plot
+  p <- ggplot(plot_data, aes(x = .data[[x_col]], y = .data[[y_col]])) +
+    geom_hline(yintercept = unique(plot_data[[y_col]]), color = "#E8E8E8") +
+    geom_point(
+      data = subset(plot_data, .data[[cor_col]] > 0), 
+      shape = 19, 
+      stroke = 0,
+      aes(size = abs(.data[[cor_col]]), color = fdr_group)
+    ) +
+    geom_point(
+      data = subset(plot_data, .data[[cor_col]] < 0), 
+      shape = 21, 
+      stroke = 0.1,
+      aes(size = abs(.data[[cor_col]]), fill = fdr_group_2)
+    ) +
+    scale_size_continuous(
+      limits = c(0, 0.6), 
+      breaks = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+    ) +
+    scale_fill_manual(
+      values = c(COLOR_PALETTES$correlation_negative, COLOR_PALETTES$significance)
+    ) +
+    scale_color_manual(
+      values = c(COLOR_PALETTES$correlation_positive, COLOR_PALETTES$significance)
+    ) +
+    cowplot::theme_cowplot() +
+    theme(
+      panel.grid.major = element_blank(),
+      axis.text.x = element_text(angle = 90, hjust = 1),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+      plot.title = element_text(hjust = 0.5)
+    ) +
+    labs(
+      color = "Positive\ncorrelation\n P-value", 
+      size = "Correlation\nStrength",
+      fill = "Negative\ncorrelation\n P-value", 
+      x = "", 
+      y = "",
+      title = paste("Correlation of bacteria with", 
+                  if(grepl("pathway", tolower(y_col))) "pathways" else "features")
+    ) +
+    guides(
+      fill = guide_legend(override.aes = list(size = 4), order = 3),
+      color = guide_legend(override.aes = list(size = 4), order = 2),
+      size = guide_legend(override.aes = list(size = c(2:7), fill = "white"), order = 1)
+    )
+  
+  # Save plot if output file is provided
+  if(!is.null(output_file)) {
+    ggsave(output_file, p, width = width, height = height)
+  }
+  
+  return(p)
+}
+
+# Main integrated analysis function
+run_multivariate_correlation_analysis <- function(bacteria_path, cluster_path, 
+                                               immunecell_path = NULL, pathway_path = NULL, 
+                                               tmb_path = NULL, selected_bacteria = NULL,
+                                               selected_immunecells = NULL, 
+                                               output_dir = "results") {
+  # Load all data
+  data <- load_multiomics_data(
+    bacteria_path = bacteria_path,
+    cluster_path = cluster_path,
+    immunecell_path = immunecell_path,
+    pathway_path = pathway_path,
+    tmb_path = tmb_path,
+    selected_bacteria = selected_bacteria,
+    selected_immunecells = selected_immunecells
+  )
+  
+  # Initialize results list
+  results <- list(
+    data = data
+  )
+  
+  # Analyze bacteria-immune cell correlations if immune data is available
+  if(!is.null(data$immune_cells)) {
+    # Create complete correlation network
+    network_complete <- create_correlation_network(
+      bacteria_data = data$bacteria,
+      immune_data = data$immune_cells,
+      filter_type = "none",
+      output_file = file.path(output_dir, "bacteria_immune_network_complete.pdf")
+    )
+    
+    # Create bacteria-cell only network
+    network_filtered <- create_correlation_network(
+      bacteria_data = data$bacteria,
+      immune_data = data$immune_cells,
+      filter_type = "bacteria_cell_only",
+      output_file = file.path(output_dir, "bacteria_immune_network_filtered.pdf")
+    )
+    
+    # Calculate detailed correlations
+    correlations_immune <- calculate_correlations(
+      data_x = data$bacteria,
+      data_y = data$immune_cells,
+      correlation_method = "spearman",
+      output_file = file.path(output_dir, "bacteria_immune_correlations.csv")
+    )
+    
+    results$immune_networks <- list(
+      complete = network_complete,
+      filtered = network_filtered
+    )
+    results$immune_correlations <- correlations_immune
+  }
+  
+  # Analyze bacteria-pathway correlations if pathway data is available
+  if(!is.null(data$pathways)) {
+    # Calculate correlations
+    correlations_pathway <- calculate_correlations(
+      data_x = data$bacteria,
+      data_y = data$pathways,
+      correlation_method = "pearson",
+      is_pathway = TRUE,
+      output_file = file.path(output_dir, "bacteria_pathway_correlations.csv")
+    )
+    
+    # Create bubble plot
+    bubble_plot <- create_correlation_bubbleplot(
+      correlation_results = correlations_pathway,
+      output_file = file.path(output_dir, "bacteria_pathway_bubbleplot.pdf")
+    )
+    
+    results$pathway_correlations <- correlations_pathway
+    results$pathway_plot <- bubble_plot
+  }
+  
+  # Analyze bacteria-TMB correlations if TMB data is available
+  if(!is.null(data$tmb)) {
+    # Prepare TMB data for correlation
+    tmb_data <- data$tmb
+    
+    # Calculate correlations (assuming TMB data has an ID column and total_perMB_log column)
+    # We need to convert TMB data to a format similar to immune cells data
+    tmb_for_corr <- tmb_data
+    rownames(tmb_for_corr) <- tmb_for_corr$ID
+    
+    correlations_tmb <- calculate_correlations(
+      data_x = data$bacteria,
+      data_y = tmb_for_corr,
+      y_names = c("total_perMB_log"),
+      correlation_method = "spearman",
+      output_file = file.path(output_dir, "bacteria_tmb_correlations.csv")
+    )
+    
+    results$tmb_correlations <- correlations_tmb
+  }
+  
+  return(results)
+}
+
+# Define selected bacteria and immune cells
+SELECTED_BACTERIA <- c(
+  "s__Pseudomonas_sp._SXM.1", "s__Pseudomonas_fluorescens", "s__Pseudomonas_sp._Colony2",
+  "s__Pseudomonas_sp._NC02", "s__Fusobacterium_nucleatum", "s__Pseudomonas_veronii",
+  "s__Rubrivivax_gelatinosus", "s__Pseudomonas_sp._So3.2b", 
+  "s__Corynebacterium_tuberculostearicum", "s__Veillonella_atypica"
+)
+
+SELECTED_IMMUNECELLS <- c(
+  "ID", "T_cells_regulatory_Tregs_CIBERSORT", "T_cells_MCPcounter",
+  "T_cells_CD4_memory_resting_CIBERSORT", "T_cell_CD4_TIMER", "Neutrophils_CIBERSORT",
+  "Neutrophil_TIMER", "Endothelial_cells_MCPcounter", "Epithelial_cells_xCell",
+  "Eosinophils_xCell", "Endothelial_EPIC", "Endothelial_cells_xCell", "Bcells_EPIC",
+  "B_cells_naive_CIBERSORT", "B_lineage_MCPcounte", "B_cells_quantiseq",
+  "Fibroblasts_MCPcounter", "CAFs_EPIC", "Dendritic_cells_resting_CIBERSORT", "DC_TIMER"
+)
+
+# Example usage (commented out)
+if (FALSE) {
+  results <- run_multivariate_correlation_analysis(
+    bacteria_path = "data/ESCA_otutable_bacteria_species.csv",
+    cluster_path = "data/tcga.clust.txt",
+    immunecell_path = "data/tme_combine.csv",
+    pathway_path = "data/imm.score.csv",
+    tmb_path = "data/ESCA_merge.masked.somatic.mutation.maf",
+    selected_bacteria = SELECTED_BACTERIA,
+    selected_immunecells = SELECTED_IMMUNECELLS
+  )
+}
