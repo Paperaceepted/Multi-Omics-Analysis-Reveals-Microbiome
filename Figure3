@@ -1,0 +1,274 @@
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(MOVICS)
+  library(data.table)
+  library(ComplexHeatmap)
+  library(purrr)
+})
+
+dir.create("results", showWarnings = FALSE)
+
+ProcessCancerData <- function(data_path, clinical_path) {
+  mo.data <- readRDS(data_path)
+  tcga.cli <- read.table(clinical_path) %>% 
+    select(fustat = OS, futime = OS.time)
+  
+  filter_criteria <- list(
+    mRNA = list(method1 = "mad", method2 = "cox", p.cutoff = 0.01),
+    lncRNA = list(method1 = "mad", method2 = "cox", p.cutoff = 0.01),
+    miRNA = list(method1 = "mad", method2 = "cox", p.cutoff = 0.01),
+    meth = list(method1 = "mad", method2 = "cox", p.cutoff = 0.05),
+    mut = list(method = "freq", elite.pct = 0.09),
+    bacteria = list(method = "sd", elite.num = 20)
+  )
+  
+  processed_data <- list()
+  
+  processed_data$mRMA <- mo.data$mRNA.exp %>% 
+    getElites(method = filter_criteria$mRNA$method1, na.action = "rm", elite.num = 5000) %>% 
+    pluck('elite.dat') %>% 
+    getElites(method = filter_criteria$mRNA$method2, surv.info = tcga.cli, 
+              p.cutoff = filter_criteria$mRNA$p.cutoff) %>% 
+    pluck('elite.dat')
+  
+  processed_data$lncRNA <- mo.data$lncRNA.exp %>% 
+    getElites(method = filter_criteria$lncRNA$method1, na.action = "rm", elite.num = 5000) %>% 
+    pluck('elite.dat') %>% 
+    getElites(method = filter_criteria$lncRNA$method2, surv.info = tcga.cli, 
+              p.cutoff = filter_criteria$lncRNA$p.cutoff) %>% 
+    pluck('elite.dat')
+  
+  processed_data$miRMA <- mo.data$miRMA.exp %>% 
+    getElites(method = filter_criteria$miRNA$method1, na.action = "rm", elite.num = 5000) %>% 
+    pluck('elite.dat') %>% 
+    getElites(method = filter_criteria$miRNA$method2, surv.info = tcga.cli, 
+              p.cutoff = filter_criteria$miRNA$p.cutoff) %>% 
+    pluck('elite.dat')
+  
+  processed_data$meth <- mo.data$meth.beta %>% 
+    getElites(method = filter_criteria$meth$method1, na.action = "rm", elite.num = 5000) %>% 
+    pluck('elite.dat') %>% 
+    getElites(method = filter_criteria$meth$method2, surv.info = tcga.cli, 
+              p.cutoff = filter_criteria$meth$p.cutoff) %>% 
+    pluck('elite.dat')
+  
+  processed_data$mut <- mo.data$mut.status %>% 
+    as.matrix() %>% 
+    getElites(method = filter_criteria$mut$method, na.action = "rm", 
+              elite.pct = filter_criteria$mut$elite.pct) %>% 
+    pluck('elite.dat')
+  
+  processed_data$bacteria <- mo.data$bacteria.exp %>% 
+    getElites(method = filter_criteria$bacteria$method, na.action = "rm", 
+              elite.num = filter_criteria$bacteria$elite.num) %>% 
+    pluck('elite.dat')
+  
+  return(list(data = processed_data, clinical = tcga.cli))
+}
+
+OptimizeClusterNumber <- function(data, output_dir = "results") {
+  optk <- getClustNum(
+    data = data,
+    is.binary = c(FALSE, FALSE, FALSE, FALSE, TRUE, FALSE), 
+    try.N.clust = 2:8, 
+    fig.path = output_dir,
+    fig.name = "cluster_optimization"
+  )
+  
+  return(optk)
+}
+
+ComputeMultiOmicsIntegration <- function(data, optk, output_dir = "results") {
+  moic.res.list <- getMOIC(
+    data = data, 
+    N.clust = optk$N.clust,
+    type = c("gaussian", "gaussian", "gaussian", "gaussian", "binomial", "gaussian")
+  )
+  
+  cmoic <- getConsensusMOIC(
+    moic.res.list = moic.res.list,
+    distance = "euclidean", 
+    linkage = "average",
+    fig.path = output_dir,
+    fig.name = "consensus_heatmap"
+  )
+  
+  return(list(moic = moic.res.list, cmoic = cmoic))
+}
+
+AnalyzeSilhouette <- function(cmoic, output_dir = "results") {
+  getSilhouette(
+    sil = cmoic$sil,
+    fig.path = output_dir,
+    fig.name = "silhouette_plot"
+  )
+}
+
+GenerateComprehensiveHeatmap <- function(data, moic.res.list, cmoic, output_dir = "results") {
+  indata <- data
+  indata$meth <- log2(indata$meth / (1 - indata$meth))
+  
+  plotdata <- getStdiz(
+    data = indata,
+    halfwidth = c(2, 2, 2, 2, NA, 2),
+    centerFlag = c(TRUE, TRUE, TRUE, TRUE, FALSE, TRUE),
+    scaleFlag = c(TRUE, TRUE, TRUE, TRUE, FALSE, TRUE)
+  )
+  
+  feat <- moic.res.list$iClusterBayes$feat.res
+  feature_sets <- lapply(c("mRMA", "lncRNA", "miRMA", "meth", "mut", "bacteria"), function(dataset) {
+    feat[which(feat$dataset == dataset), ][1:10, "feature"]
+  })
+  
+  color_palettes <- list(
+    c("#3288bd", "#66c2a5", "#ffffbf", "#f46d43", "#9e0142"),
+    c("#00A087FF", "#F0F0F5", "#E64B35FF"),
+    c("#440154", "#482878", "#3E4989", "#31688E", "#26828E", "#1F9E89", "#35B779", "#6ECC6A", "#B5DE2B", "#FDE725"),
+    c("#8491B4FF", "#B09C85FF", "#DC0000FF"),
+    c("grey", "#0F0F10"),
+    c("#1F66AC", "#75AFD3", "grey90", "#FAB99B", "#B2192B")
+  )
+  
+  getMoHeatmap(
+    data = plotdata,
+    row.title = c("mRNA", "lncRNA", "miRMA", "Methylation", "Mutation", "Bacteria"),
+    is.binary = c(FALSE, FALSE, FALSE, FALSE, TRUE, FALSE),
+    legend.name = c("mRNA", "lncRNA", "miRMA", "M value", "Mutated", "Bacteria"),
+    clust.res = cmoic$clust.res,
+    annRow = feature_sets,
+    color = color_palettes,
+    width = 10,
+    height = 6,
+    fig.path = output_dir,
+    fig.name = "comprehensive_heatmap"
+  )
+}
+
+GenerateClusteringMethodsHeatmap <- function(moic.res.list, cmoic, output_dir = "results") {
+  cmoic$clust.res %>% 
+    select(clust) %>% 
+    write.table(file.path(output_dir, "tcga_subtypes.txt"), sep = "\t", quote = FALSE)
+  
+  clust.res <- cmoic$clust.res$clust
+  
+  for (moic.res in moic.res.list) {
+    clust.res <- cbind(clust.res, moic.res$clust.res$clust)
+  }
+  
+  colnames(clust.res) <- c('Subtype', names(moic.res.list))
+  
+  subtype_colors <- setNames(
+    c("#2EC4B6", "#DB1F37", "#FF9F1C", "#33429B", "#3AC2EB", "#A4D283", 
+      "#F8ED30", "#F79368", "#D51A65", "#B31F24", "#66c2a5"),
+    1:11
+  )
+  
+  clust.res <- as.data.frame(clust.res) %>% arrange(Subtype)
+  anno <- HeatmapAnnotation(
+    df = clust.res, 
+    show_legend = FALSE,
+    col = list(Subtype = subtype_colors)
+  )
+  
+  pdf(file = file.path(output_dir, "clustering_methods.pdf"), width = 5, height = 3)
+  print(Heatmap(matrix(nrow = 0, ncol = length(clust.res$Subtype)), top_annotation = anno))
+  dev.off()
+}
+
+PerformSurvivalAnalysis <- function(cmoic, tcga.cli, output_dir = "results") {
+  surv <- compSurv(
+    moic.res = cmoic,
+    surv.info = tcga.cli,
+    convt.time = "m",
+    surv.median.line = "hv",
+    fig.path = output_dir,
+    fig.name = "survival_curve"
+  )
+  
+  return(surv)
+}
+
+SaveResults <- function(moic.res.list, cmoic, output_dir = "results") {
+  saveRDS(moic.res.list, file.path(output_dir, "moic_results.rds"), compress = FALSE)
+  saveRDS(cmoic, file.path(output_dir, "cmoic_results.rds"), compress = FALSE)
+}
+
+RunMultiOmicsAnalysis <- function(data_path, clinical_path, output_dir = "results") {
+  processed_data <- ProcessCancerData(data_path, clinical_path)
+  mo.data <- processed_data$data
+  tcga.cli <- processed_data$clinical
+  
+  optk <- OptimizeClusterNumber(mo.data, output_dir)
+  
+  integration_results <- ComputeMultiOmicsIntegration(mo.data, optk, output_dir)
+  moic.res.list <- integration_results$moic
+  cmoic <- integration_results$cmoic
+  
+  AnalyzeSilhouette(cmoic, output_dir)
+  GenerateComprehensiveHeatmap(mo.data, moic.res.list, cmoic, output_dir)
+  GenerateClusteringMethodsHeatmap(moic.res.list, cmoic, output_dir)
+  survival_results <- PerformSurvivalAnalysis(cmoic, tcga.cli, output_dir)
+  
+  SaveResults(moic.res.list, cmoic, output_dir)
+  
+  return(list(
+    optk = optk,
+    moic = moic.res.list,
+    cmoic = cmoic,
+    survival = survival_results
+  ))
+}
+
+# Wrapper function for caching results
+CachedMultiOmicsAnalysis <- function(data_path, clinical_path, output_dir = "results", use_cache = TRUE) {
+  cache_file <- file.path(output_dir, "analysis_cache.rds")
+  
+  if (use_cache && file.exists(cache_file)) {
+    message("Loading cached results...")
+    return(readRDS(cache_file))
+  }
+  
+  results <- RunMultiOmicsAnalysis(data_path, clinical_path, output_dir)
+  
+  if (use_cache) {
+    saveRDS(results, cache_file)
+  }
+  
+  return(results)
+}
+
+# Optional: Function to generate detailed report
+GenerateDetailedReport <- function(results, output_dir = "results") {
+  report_file <- file.path(output_dir, "analysis_report.txt")
+  sink(report_file)
+  
+  cat("=== ESOPHAGEAL CANCER MULTI-OMICS ANALYSIS REPORT ===\n\n")
+  
+  cat("OPTIMAL CLUSTER NUMBER:", results$optk$N.clust, "\n\n")
+  
+  cat("CLUSTERING METHODS USED:\n")
+  cat(paste(" -", names(results$moic)), sep = "\n")
+  cat("\n")
+  
+  cat("SILHOUETTE ANALYSIS:\n")
+  silhouette_avg <- mean(results$cmoic$sil[, "sil_width"])
+  cat("Average silhouette width:", round(silhouette_avg, 3), "\n\n")
+  
+  cat("SURVIVAL ANALYSIS:\n")
+  cat("Log-rank p-value:", format(results$survival$surv.pval, digits = 3), "\n\n")
+  
+  cat("ANALYSIS COMPLETED SUCCESSFULLY\n")
+  sink()
+}
+
+# Main execution
+if (interactive()) {
+  analysis_results <- CachedMultiOmicsAnalysis(
+    data_path = "data/mo.data.rds",
+    clinical_path = "data/tcga.cli.txt",
+    output_dir = "results",
+    use_cache = TRUE
+  )
+  
+  GenerateDetailedReport(analysis_results, "results")
+}
