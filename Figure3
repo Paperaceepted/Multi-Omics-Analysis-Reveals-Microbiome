@@ -1,0 +1,450 @@
+# Advanced ESCA Microbiome Analysis with Clinical Staging
+suppressPackageStartupMessages({
+  library(microeco)
+  library(magrittr)
+  library(ggplot2)
+  library(dplyr)
+  library(ggradar)
+  library(ggtree)
+  library(ggpubr)
+})
+
+# Global configuration
+GlobalConfig <- list(
+  colors = c("#253494", "#2C7FB8", "#41B6C4", "#7FCDBB", "#C7E9B4", "#FFFFCC"),
+  output_dir = "results"
+)
+
+dir.create(GlobalConfig$output_dir, showWarnings = FALSE)
+theme_set(theme_bw())
+
+#=================DATA PREPARATION=================
+prepare_data <- function(species_path = "data/ESCA_otutable_bacteria_species.csv", 
+                        clinical_path = "data/ESCA_clinical.txt") {
+  # Load bacterial data
+  bacteria_species <- read.csv(species_path, header = TRUE, row.names = 1) %>%
+    subset(select = -cancertype)
+  
+  # Load clinical data
+  clinical_data <- read.delim(clinical_path, header = TRUE, stringsAsFactors = FALSE)
+  
+  # Process data
+  species_sums <- colSums(bacteria_species)
+  nonzero_species <- names(species_sums)[species_sums > 0]
+  bacteria_species_nonzero <- bacteria_species[, nonzero_species]
+  species_rel <- sweep(bacteria_species_nonzero, 1, rowSums(bacteria_species_nonzero), FUN = "/")
+  
+  # Filter by tumor and stage
+  tumor_samples <- rownames(species_rel)[!grepl("11$", rownames(species_rel))]
+  tumor_samples_filtered <- intersect(
+    tumor_samples, 
+    clinical_data$Samples[clinical_data$AJCC_Stage != ""]
+  )
+  species_rel_tumor <- species_rel[tumor_samples_filtered, ]
+  
+  # Create sample metadata
+  sample_table <- data.frame(
+    Group = factor(
+      clinical_data$AJCC_Stage[match(rownames(species_rel_tumor), clinical_data$Samples)],
+      levels = c("I", "II", "III", "IV")
+    ),
+    row.names = rownames(species_rel_tumor)
+  )
+  
+  # Calculate sample counts
+  sample_counts <- sapply(levels(sample_table$Group), function(stage) {
+    sum(sample_table$Group == stage)
+  })
+  names(sample_counts) <- levels(sample_table$Group)
+  
+  # Create taxonomy table
+  tax_table <- data.frame(
+    Species = colnames(species_rel_tumor),
+    row.names = colnames(species_rel_tumor)
+  )
+  
+  # Create microtable dataset
+  dataset <- microtable$new(
+    sample_table = sample_table,
+    otu_table = t(species_rel_tumor) %>% as.data.frame(),
+    tax_table = tax_table
+  )
+  
+  # Add sample counts as attribute
+  attr(dataset, "sample_counts") <- sample_counts
+  
+  return(list(dataset = dataset, clinical_data = clinical_data))
+}
+
+#=================ALPHA DIVERSITY ANALYSIS=================
+analyze_alpha_diversity <- function(dataset) {
+  # Calculate alpha diversity
+  dataset$cal_alphadiv(PD = FALSE)
+  
+  # Create trans_alpha object
+  alpha_transformer <- trans_alpha$new(dataset = dataset, group = "Group")
+  
+  # Statistical tests
+  alpha_transformer$cal_diff(method = "KW")
+  
+  # Plot alpha diversity with statistical comparisons
+  metrics <- c("Shannon", "Simpson", "Chao1")
+  
+  for (metric in metrics) {
+    p <- alpha_transformer$plot_alpha(
+      pair_compare = TRUE, 
+      measure = metric
+    ) + theme_classic()
+    
+    ggsave(
+      file.path(GlobalConfig$output_dir, paste0("alpha_", tolower(metric), ".pdf")),
+      p, width = 5, height = 5
+    )
+  }
+  
+  return(alpha_transformer)
+}
+
+#=================BETA DIVERSITY ANALYSIS=================
+analyze_beta_diversity <- function(dataset) {
+  # Calculate beta diversity
+  dataset$cal_betadiv(unifrac = FALSE)
+  
+  # Create trans_beta object and perform ordination
+  beta_transformer <- trans_beta$new(
+    dataset = dataset, 
+    group = "Group", 
+    measure = "bray"
+  )
+  
+  beta_transformer$cal_ordination(method = "PCoA")
+  
+  # Plot ordination
+  p <- beta_transformer$plot_ordination(
+    plot_color = "Group", 
+    plot_shape = "Group", 
+    plot_type = c("point", "ellipse")
+  ) + theme_test()
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "beta_pcoa.pdf"),
+    p, width = 7, height = 5
+  )
+  
+  # Calculate and plot group distances
+  beta_transformer$cal_group_distance()
+  beta_transformer$cal_group_distance(within_group = FALSE)
+  
+  p2 <- beta_transformer$plot_group_distance(distance_pair_stat = TRUE)
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "beta_group_distances.pdf"),
+    p2, width = 7, height = 5
+  )
+  
+  return(beta_transformer)
+}
+
+#=================TAXONOMIC VISUALIZATION=================
+visualize_abundance <- function(dataset) {
+  sample_counts <- attr(dataset, "sample_counts")
+  
+  # Community composition by sample
+  t1 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = 10)
+  p1 <- t1$plot_bar(
+    others_color = "grey70", 
+    facet = "Group", 
+    xtext_keep = FALSE, 
+    legend_text_italic = FALSE
+  ) + scale_fill_manual(values = colorRampPalette(rev(GlobalConfig$colors))(11))
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "community_by_sample.pdf"),
+    p1, width = 10.85, height = 4
+  )
+  
+  # Community composition by group mean
+  t2 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = 10, groupmean = "Group")
+  p2 <- t2$plot_bar(
+    others_color = "grey70", 
+    legend_text_italic = FALSE
+  ) + 
+    scale_fill_manual(values = colorRampPalette(rev(GlobalConfig$colors))(11)) +
+    theme_classic() +
+    scale_x_discrete(
+      labels = sapply(names(sample_counts), function(stage) {
+        paste0(stage, " (n=", sample_counts[stage], ")")
+      })
+    ) +
+    theme(
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black")
+    )
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "community_by_group.pdf"),
+    p2, width = 5, height = 4
+  )
+  
+  # Generate abundance data table
+  abundance_data <- t1$data_abund
+  total_abundance <- tapply(abundance_data$Abundance, abundance_data$Taxonomy, sum)
+  top10_species <- names(sort(total_abundance, decreasing = TRUE))[1:10]
+  
+  result <- data.frame(
+    Species = top10_species,
+    Stage_I = 0,
+    Stage_II = 0,
+    Stage_III = 0,
+    Stage_IV = 0
+  )
+  
+  for (stage in c("I", "II", "III", "IV")) {
+    stage_data <- subset(abundance_data, Group == stage)
+    if (nrow(stage_data) > 0) {
+      means <- tapply(stage_data$Abundance, stage_data$Taxonomy, mean)
+      matching_species <- intersect(names(means), result$Species)
+      if (length(matching_species) > 0) {
+        result[result$Species %in% matching_species, paste0("Stage_", stage)] <- 
+          means[matching_species]
+      }
+    }
+  }
+  
+  # Calculate other species
+  others_means <- sapply(c("I", "II", "III", "IV"), function(stage) {
+    stage_data <- subset(abundance_data, Group == stage)
+    if (nrow(stage_data) > 0) {
+      other_species <- unique(stage_data$Taxonomy[!stage_data$Taxonomy %in% top10_species])
+      if (length(other_species) > 0) {
+        return(sum(tapply(
+          stage_data$Abundance[stage_data$Taxonomy %in% other_species],
+          stage_data$Taxonomy[stage_data$Taxonomy %in% other_species],
+          mean
+        )))
+      }
+    }
+    return(0)
+  })
+  
+  names(others_means) <- paste0("Stage_", c("I", "II", "III", "IV"))
+  result <- rbind(result, c("Others", others_means))
+  rownames(result) <- result$Species
+  result$Species <- NULL
+  
+  write.csv(
+    result, 
+    file.path(GlobalConfig$output_dir, "species_abundance_top10.csv")
+  )
+  
+  # Pie charts
+  t3 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = 10, groupmean = "Group")
+  p3 <- t3$plot_pie(
+    facet_nrow = 2, 
+    add_label = TRUE
+  ) + scale_fill_manual(values = colorRampPalette(rev(GlobalConfig$colors))(11))
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "community_pie.pdf"),
+    p3, width = 8, height = 8
+  )
+  
+  # Radar chart
+  t4 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = 10, groupmean = "Group")
+  p4 <- t4$plot_radar(
+    values.radar = c("0%", "25%", "50%", "75%", "100%"), 
+    grid.min = 0, 
+    grid.mid = 0.25, 
+    grid.max = 0.5
+  )
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "community_radar.pdf"),
+    p4, width = 8, height = 6
+  )
+  
+  # Alluvial diagram
+  t5 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = 10)
+  p5 <- t5$plot_bar(
+    use_alluvium = TRUE, 
+    clustering = TRUE, 
+    facet = "Group", 
+    xtext_type_hor = FALSE, 
+    xtext_keep = FALSE, 
+    xtext_size = 6
+  ) + scale_fill_manual(values = colorRampPalette(rev(GlobalConfig$colors))(11))
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "community_alluvial.pdf"),
+    p5, width = 9, height = 4
+  )
+  
+  # Boxplot
+  t6 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = 10)
+  p6 <- t6$plot_box(
+    group = "Group", 
+    xtext_angle = 45
+  ) + theme_test()
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "community_boxplot.pdf"),
+    p6, width = 10, height = 4
+  )
+  
+  # Heatmap
+  t7 <- trans_abund$new(dataset = dataset, taxrank = "Species", ntaxa = 30)
+  p7 <- t7$plot_heatmap(
+    facet = "Group", 
+    xtext_keep = FALSE, 
+    withmargin = FALSE, 
+    plot_breaks = c(0.01, 0.1, 1, 10)
+  )
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "community_heatmap.pdf"),
+    p7, width = 7, height = 5
+  )
+  
+  return(list(data = result, transformers = list(t1, t2, t3, t4, t5, t6, t7)))
+}
+
+#=================VENN DIAGRAM ANALYSIS=================
+analyze_venn <- function(dataset) {
+  # Merge samples by group
+  dataset_merged <- dataset$merge_samples(use_group = "Group")
+  
+  # Create Venn diagram
+  venn_transformer <- trans_venn$new(dataset_merged, ratio = "seqratio")
+  p <- venn_transformer$plot_venn()
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "species_venn.pdf"),
+    p, width = 6, height = 5
+  )
+  
+  return(venn_transformer)
+}
+
+#=================DIFFERENTIAL ABUNDANCE ANALYSIS=================
+analyze_differential_abundance <- function(dataset) {
+  # LEfSe analysis
+  diff_transformer <- trans_diff$new(
+    dataset = dataset, 
+    method = "lefse", 
+    group = "Group", 
+    alpha = 0.05, 
+    lefse_subgroup = NULL
+  )
+  
+  # Differential abundance bar plot
+  p1 <- diff_transformer$plot_diff_bar(threshold = 3)
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "diff_species_bar.pdf"),
+    p1, width = 6, height = 5
+  )
+  
+  # Top 20 differential features
+  p2 <- diff_transformer$plot_diff_bar(
+    use_number = 1:20, 
+    width = 0.8
+  )
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "diff_species_top20.pdf"),
+    p2, width = 6, height = 5
+  )
+  
+  # Custom visualization
+  Lefse_diff <- diff_transformer$res_diff
+  Lefse_diff <- Lefse_diff[Lefse_diff$P.unadj < 0.05, ]
+  
+  top_taxa_by_stage <- lapply(levels(dataset$sample_table$Group), function(stage) {
+    stage_data <- Lefse_diff[Lefse_diff$Group == stage, ]
+    if (nrow(stage_data) == 0) return(NULL)
+    return(stage_data[order(stage_data$P.unadj), ][1:min(10, nrow(stage_data)), ])
+  })
+  
+  plot_data <- do.call(rbind, top_taxa_by_stage[!sapply(top_taxa_by_stage, is.null)])
+  
+  if (nrow(plot_data) > 0) {
+    p3 <- ggbarplot(
+      plot_data, 
+      x = "Taxa", 
+      y = "LDA", 
+      fill = "Group",
+      orientation = "horiz",
+      palette = colorRampPalette(GlobalConfig$colors)(length(unique(plot_data$Group))),
+      legend = "right",
+      sort.val = "desc",
+      sort.by.groups = TRUE,
+      ylab = "LDA score", 
+      xlab = ""
+    ) +
+      scale_y_continuous(expand = c(0, 0)) + 
+      scale_x_discrete(expand = c(0, 0)) +
+      labs(title = "Stage-Enriched Species", subtitle = "Top significant species by stage (p < 0.05)")
+    
+    ggsave(
+      file.path(GlobalConfig$output_dir, "diff_species_custom.pdf"),
+      p3, width = 6, height = 5
+    )
+  }
+  
+  # Abundance plot with significance
+  p4 <- diff_transformer$plot_diff_abund(
+    use_number = 1:20,
+    add_sig = TRUE,
+    coord_flip = TRUE
+  ) + theme_test()
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "diff_species_abundance.pdf"),
+    p4, width = 6, height = 8
+  )
+  
+  # Cladogram
+  p5 <- diff_transformer$plot_diff_cladogram(
+    use_taxa_num = 100,
+    use_feature_num = 20,
+    clade_label_level = 5
+  )
+  
+  ggsave(
+    file.path(GlobalConfig$output_dir, "diff_species_cladogram.pdf"),
+    p5, width = 5, height = 5
+  )
+  
+  return(diff_transformer)
+}
+
+#=================MAIN FUNCTION=================
+run_analysis <- function(species_path = "data/ESCA_otutable_bacteria_species.csv", 
+                        clinical_path = "data/ESCA_clinical.txt") {
+  # Prepare data
+  data_list <- prepare_data(species_path, clinical_path)
+  dataset <- data_list$dataset
+  clinical_data <- data_list$clinical_data
+  
+  # Run analyses
+  alpha_results <- analyze_alpha_diversity(dataset)
+  beta_results <- analyze_beta_diversity(dataset)
+  abundance_results <- visualize_abundance(dataset)
+  venn_results <- analyze_venn(dataset)
+  diff_results <- analyze_differential_abundance(dataset)
+  
+  # Return results
+  return(list(
+    dataset = dataset,
+    alpha = alpha_results,
+    beta = beta_results,
+    abundance = abundance_results,
+    venn = venn_results,
+    diff = diff_results
+  ))
+}
+
+# Execute the analysis if run directly
+if (interactive()) {
+  results <- run_analysis()
+}
