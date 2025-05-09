@@ -1,0 +1,646 @@
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(ComplexHeatmap)
+  library(GSVA)
+  library(RTN)
+  library(MOVICS)
+  library(IOBR)
+  library(limma)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(enrichplot)
+  library(ggplot2)
+  library(patchwork)
+})
+
+dir.create("results", showWarnings = FALSE)
+
+# Color schemes
+COLOR_PALETTES <- list(
+  heatmap = grDevices::colorRampPalette(c("#1F66AC", "#75AFD3", "grey90", "#FAB99B", "#B2192B"))(64),
+  heatmap_alt = grDevices::colorRampPalette(c("#253494", "#2C7FB8", "#41B6C4", "#7FCDBB", "#C7E9B4", "#FFFFCC"))(64),
+  subtypes = c("#2EC4B6", "#E71D36", "#FF9F1C", "#BDD5EA", "#FFA5AB", "#011627", "#023E8A", "#9D4EDD"),
+  binary = c("#4DBBD5FF", "#E64B35FF"),
+  gradient = c("#253494", "#2C7FB8", "#41B6C4", "#7FCDBB", "#C7E9B4", "#FFFFCC")
+)
+
+# Function to load gene expression and cluster data
+load_expression_data <- function(exp_path, cluster_path) {
+  # Load expression data
+  exp_data <- read.table(exp_path, check.names = FALSE)
+  
+  # Load cluster information
+  cluster_data <- read.table(cluster_path) %>% arrange(clust)
+  
+  # Order samples
+  sample_order <- rownames(cluster_data)
+  exp_data <- exp_data[, intersect(colnames(exp_data), sample_order)]
+  
+  return(list(
+    expression = exp_data,
+    clusters = cluster_data,
+    sample_order = sample_order
+  ))
+}
+
+# Function to load pathways and perform ssGSEA
+perform_ssgsea_analysis <- function(expression_data, pathway_dir, cluster_data, method = "wilcox") {
+  # Load pathway files
+  pathway_files <- list.files(pathway_dir, pattern = '.gmt$')
+  
+  # Combine all pathway files
+  pathway_data <- as.data.frame(data.table::rbindlist(lapply(pathway_files, function(x) {
+    df <- clusterProfiler::read.gmt(file.path(pathway_dir, x))
+    df$`Pathway Enrichment` <- gsub('.gmt', "", x)
+    return(df)
+  })))
+  
+  # Create gene list by pathway
+  pathway_genes <- split(x = pathway_data$gene, f = pathway_data$term)
+  
+  # Create pathway annotation
+  pathway_annotation <- pathway_data %>% 
+    select(term, 'Pathway Enrichment') %>% 
+    distinct() %>% 
+    column_to_rownames('term')
+  
+  # Calculate ssGSEA scores
+  ssgsea_scores <- GSVA::gsva(as.matrix(expression_data), 
+                              pathway_genes, 
+                              method = 'ssgsea') %>% 
+    t() %>% 
+    scale() %>% 
+    t() %>% 
+    replace_na(0)
+  
+  # Create sample annotation
+  if (colnames(cluster_data)[1] == "clust") {
+    sample_annotation <- cluster_data %>% 
+      mutate(Subtype = paste0("C", clust)) %>% 
+      select(Subtype)
+  } else {
+    sample_annotation <- cluster_data
+  }
+  
+  # Statistical analysis
+  if (method == "wilcox") {
+    # Calculate p-values using Wilcoxon test
+    pvalues <- apply(ssgsea_scores, 1, function(x) {
+      wilcox.test(x ~ sample_annotation$Subtype)$p.value
+    })
+    
+    # Filter significant pathways
+    significant_pathways <- names(pvalues)[pvalues < 0.1]
+    
+    # Update annotation with p-values
+    significant_annotation <- pathway_annotation[significant_pathways, , drop = FALSE]
+    significant_annotation$Pathway <- rownames(significant_annotation)
+    significant_annotation$Pvalue <- signif(pvalues[significant_pathways], 3)
+    
+    # Update row names with p-values
+    rownames(significant_annotation) <- paste0(significant_annotation$Pathway, 
+                                              " (P=", significant_annotation$Pvalue, ")")
+    
+    # Filter scores to significant pathways
+    significant_scores <- ssgsea_scores[significant_pathways, ]
+    rownames(significant_scores) <- rownames(significant_annotation)
+    
+  } else if (method == "limma") {
+    # Ensure sample_annotation has rownames matching ssgsea_scores
+    rownames(sample_annotation) <- colnames(ssgsea_scores)
+    
+    # Create design matrix
+    design <- model.matrix(~0+Subtype, data = sample_annotation)
+    
+    # Fit linear model
+    fit <- limma::lmFit(ssgsea_scores, design)
+    
+    # Create contrast matrix
+    if (length(unique(sample_annotation$Subtype)) == 2) {
+      subtypes <- unique(sample_annotation$Subtype)
+      contrast_formula <- paste0(subtypes[2], "-", subtypes[1])
+      contrast_matrix <- limma::makeContrasts(contrasts = contrast_formula, levels = design)
+    } else {
+      stop("Limma method requires exactly 2 subtypes")
+    }
+    
+    # Apply contrasts and empirical Bayes
+    fit2 <- limma::contrasts.fit(fit, contrast_matrix)
+    fit2 <- limma::eBayes(fit2)
+    
+    # Get differential results
+    diff_results <- limma::topTable(fit2, coef = 1, n = Inf, adjust.method = "BH")
+    significant_diff <- diff_results[abs(diff_results$logFC) > 0 & diff_results$P.Value < 1, ]
+    
+    # Update annotation
+    significant_annotation <- pathway_annotation[rownames(significant_diff), , drop = FALSE]
+    
+    # Filter scores to significant pathways
+    significant_scores <- ssgsea_scores[rownames(significant_diff), ]
+    rownames(significant_scores) <- rownames(significant_annotation)
+  }
+  
+  # Return results
+  return(list(
+    all_scores = ssgsea_scores,
+    significant_scores = significant_scores,
+    pathway_annotation = pathway_annotation,
+    significant_annotation = significant_annotation[, "Pathway Enrichment", drop = FALSE],
+    sample_annotation = sample_annotation,
+    pvalues = if (method == "wilcox") pvalues else NULL,
+    limma_results = if (method == "limma") diff_results else NULL
+  ))
+}
+
+# Function to create pathway heatmap
+create_pathway_heatmap <- function(scores, sample_order, sample_annotation, pathway_annotation, 
+                                 subtype_colors = NULL, output_file = NULL, width = 9, height = 6) {
+  # Define subtype colors if not provided
+  if (is.null(subtype_colors)) {
+    subtypes <- unique(sample_annotation$Subtype)
+    color_palette <- COLOR_PALETTES$subtypes[1:length(subtypes)]
+    names(color_palette) <- subtypes
+    subtype_colors <- list("Subtype" = color_palette)
+  } else if (!is.list(subtype_colors)) {
+    subtype_colors <- list("Subtype" = subtype_colors)
+  }
+  
+  # Create heatmap
+  heatmap <- ComplexHeatmap::pheatmap(
+    scores[, sample_order],
+    heatmap_legend_param = list(title = "Pathway type"),
+    cluster_cols = FALSE,
+    cluster_rows = TRUE,
+    show_row_dend = FALSE,
+    show_colnames = FALSE,
+    color = COLOR_PALETTES$heatmap,
+    breaks = seq(-2, 2, length.out = 64),
+    annotation_col = sample_annotation,
+    annotation_colors = subtype_colors,
+    row_split = pathway_annotation$`Pathway Enrichment`,
+    annotation_row = pathway_annotation,
+    annotation_names_row = FALSE,
+    row_title = NULL,
+    show_rownames = TRUE
+  )
+  
+  # Save if output file is provided
+  if (!is.null(output_file)) {
+    pdf(output_file, width = width, height = height)
+    print(heatmap)
+    dev.off()
+  }
+  
+  return(heatmap)
+}
+
+# Function to analyze transcription regulatory network
+analyze_trn <- function(expression_data, sample_order, cluster_data, 
+                      tf_lists, output_file = NULL, width = 10, height = 10) {
+  # Filter TFs to those present in expression data
+  tf_lists_filtered <- lapply(tf_lists, function(tfs) {
+    intersect(rownames(expression_data), tfs)
+  })
+  
+  # Combine all TFs
+  all_tfs <- unlist(tf_lists_filtered)
+  
+  # Initialize TNI object
+  rtni <- tni.constructor(expData = as.matrix(expression_data), 
+                         regulatoryElements = all_tfs)
+  
+  # Perform permutation analysis
+  rtni <- tni.permutation(rtni, nPermutations = 100)
+  
+  # Perform bootstrap analysis
+  rtni <- tni.bootstrap(rtni)
+  
+  # Apply DPI filter
+  rtni <- tni.dpi.filter(rtni)
+  
+  # Perform GSEA analysis
+  rtni <- tni.gsea2(rtni)
+  
+  # Save results
+  if (!is.null(output_file)) {
+    saveRDS(rtni, gsub("\\.pdf$", ".rds", output_file), compress = FALSE)
+  }
+  
+  # Extract regulon activity
+  regulon_activity <- tni.get(rtni, what = "regulonActivity")
+  activity_data <- regulon_activity$differential %>% scale() %>% t()
+  
+  # Create sample annotation
+  sample_annotation <- cluster_data %>%
+    mutate(Subtype = paste0("CS", clust)) %>%
+    select(Subtype)
+  
+  # Define colors
+  colors <- COLOR_PALETTES$subtypes
+  names(colors) <- paste0("CS", 1:8)
+  annotation_colors <- list("Subtype" = colors)
+  
+  # Create top heatmap for first TF list
+  heatmap_top <- ComplexHeatmap::pheatmap(
+    activity_data[tf_lists_filtered[[1]], sample_order],
+    heatmap_legend_param = list(title = "MUC Regulon"),
+    cluster_cols = FALSE,
+    cluster_rows = TRUE,
+    show_row_dend = FALSE,
+    show_colnames = FALSE,
+    color = COLOR_PALETTES$heatmap,
+    breaks = seq(-2, 2, length.out = 64),
+    annotation_col = sample_annotation,
+    annotation_colors = annotation_colors
+  )
+  
+  # Create bottom heatmap for second TF list
+  tf_subset <- tf_lists_filtered[[2]][tf_lists_filtered[[2]] %in% rownames(activity_data)]
+  heatmap_bottom <- ComplexHeatmap::pheatmap(
+    activity_data[tf_subset, sample_order],
+    heatmap_legend_param = list(title = "Chromatin Remodeling"),
+    cluster_cols = FALSE,
+    cluster_rows = TRUE,
+    show_row_dend = FALSE,
+    show_colnames = FALSE,
+    color = COLOR_PALETTES$heatmap_alt,
+    breaks = seq(-2, 2, length.out = 64)
+  )
+  
+  # Combine heatmaps
+  combined_heatmap <- heatmap_top %v% heatmap_bottom
+  
+  # Save if output file is provided
+  if (!is.null(output_file)) {
+    pdf(output_file, width = width, height = height)
+    print(combined_heatmap)
+    dev.off()
+  }
+  
+  return(list(
+    rtni = rtni,
+    activity_data = activity_data,
+    heatmap = combined_heatmap
+  ))
+}
+
+# Function to perform differential gene expression analysis
+analyze_differential_expression <- function(expression_data, cluster_data, output_prefix = NULL) {
+  # Create design matrix
+  design <- model.matrix(~0 + cluster_data$Group)
+  colnames(design) <- levels(factor(cluster_data$Group))
+  
+  # Fit linear model
+  fit <- lmFit(expression_data, design)
+  
+  # Create contrast matrix
+  contrast_matrix <- makeContrasts(C2 - C1, levels = design)
+  
+  # Apply contrasts and empirical Bayes
+  fit2 <- contrasts.fit(fit, contrast_matrix)
+  fit2 <- eBayes(fit2)
+  
+  # Get results
+  results <- topTable(fit2, coef = 1, number = Inf)
+  
+  # Filter significant genes
+  all_diff_genes <- results %>% filter(adj.P.Val < 0.05)
+  sig_diff_genes <- results %>% filter(abs(logFC) > 1 & adj.P.Val < 0.05)
+  
+  # Save results if output prefix provided
+  if (!is.null(output_prefix)) {
+    write.csv(all_diff_genes, paste0(output_prefix, "_all_diff_genes.csv"), row.names = TRUE)
+    write.csv(sig_diff_genes, paste0(output_prefix, "_sig_diff_genes.csv"), row.names = TRUE)
+  }
+  
+  return(list(
+    all_diff = all_diff_genes,
+    sig_diff = sig_diff_genes
+  ))
+}
+
+# Function to perform KEGG enrichment analysis
+perform_kegg_enrichment <- function(diff_expr_data, log2fc_threshold = 2, output_prefix = NULL) {
+  # Add gene IDs
+  diff_expr_data$ID <- rownames(diff_expr_data)
+  
+  # Extract relevant columns
+  rt <- diff_expr_data[diff_expr_data$P.Value < 0.05, c("ID", "logFC")]
+  
+  # Function to process data for a specific direction
+  process_data <- function(rt, log2fc, direction) {
+    # Filter genes by direction
+    genes <- rt$logFC > log2fc * ifelse(direction == "up", 1, -1)
+    
+    # Map to Entrez IDs
+    entrez_ids <- mapIds(org.Hs.eg.db, 
+                         keys = rt[genes, 1], 
+                         keytype = "SYMBOL", 
+                         column = "ENTREZID")
+    
+    # Perform enrichment
+    result <- enrichKEGG(entrez_ids,
+                       organism = "hsa", 
+                       keyType = "kegg", 
+                       pvalueCutoff = 1, 
+                       pAdjustMethod = "BH", 
+                       qvalueCutoff = 1)
+    
+    # Save results if output prefix provided
+    if (!is.null(output_prefix)) {
+      file_name <- paste0(output_prefix, "_", ifelse(direction == "up", "C2", "C1"), "_kegg.txt")
+      write.table(result, file = file_name, sep = "\t", quote = FALSE, row.names = FALSE)
+    }
+    
+    return(result)
+  }
+  
+  # Process up and down regulated genes
+  up_enrichment <- process_data(rt, log2fc_threshold, "up")
+  down_enrichment <- process_data(rt, log2fc_threshold, "down")
+  
+  return(list(
+    up = up_enrichment,
+    down = down_enrichment
+  ))
+}
+
+# Function to perform GO enrichment analysis
+perform_go_enrichment <- function(diff_expr_data, log2fc_threshold = 2, output_prefix = NULL) {
+  # Add gene IDs
+  diff_expr_data$ID <- rownames(diff_expr_data)
+  
+  # Extract relevant columns
+  rt <- diff_expr_data[diff_expr_data$P.Value < 0.05, c("ID", "logFC")]
+  
+  # Function to process data for a specific direction
+  process_data <- function(rt, log2fc, direction) {
+    # Filter genes by direction
+    genes <- rt$logFC > log2fc * ifelse(direction == "up", 1, -1)
+    
+    # Map to Entrez IDs
+    entrez_ids <- mapIds(org.Hs.eg.db, 
+                         keys = rt[genes, 1], 
+                         keytype = "SYMBOL", 
+                         column = "ENTREZID")
+    
+    # Perform enrichment
+    result <- enrichGO(entrez_ids,
+                     OrgDb = org.Hs.eg.db,
+                     ont = "BP",
+                     pAdjustMethod = "BH",
+                     pvalueCutoff = 0.05,
+                     qvalueCutoff = 0.2)
+    
+    # Save results if output prefix provided
+    if (!is.null(output_prefix)) {
+      file_name <- paste0(output_prefix, "_", ifelse(direction == "up", "C2", "C1"), "_go.txt")
+      write.table(result, file = file_name, sep = "\t", quote = FALSE, row.names = FALSE)
+    }
+    
+    return(result)
+  }
+  
+  # Process up and down regulated genes
+  up_enrichment <- process_data(rt, log2fc_threshold, "up")
+  down_enrichment <- process_data(rt, log2fc_threshold, "down")
+  
+  return(list(
+    up = up_enrichment,
+    down = down_enrichment
+  ))
+}
+
+# Function to visualize enrichment results
+visualize_enrichment <- function(up_data, down_data, title_up = "C2", title_down = "C1", 
+                               color_up = '#E64B35FF', color_down = '#4DBBD5FF',
+                               output_file = NULL, width = 9, height = 5) {
+  # Function to process and format one dataset
+  process_data <- function(data, title, color) {
+    data <- data[1:10, c(2, 5)]
+    data$pvalue <- -log10(data$pvalue)
+    data <- data[order(data$pvalue, decreasing = TRUE), ]
+    data$Description <- factor(data$Description, levels = data$Description)
+    
+    ggplot(data, aes(x = pvalue, y = Description)) +
+      geom_col(fill = color, color = 'black', width = 0.6) +
+      xlab("-log10(pvalue)") + ylab("") + ggtitle(title) +
+      theme_test() +
+      scale_y_discrete(position = ifelse(title == title_up, "left", "right")) +
+      if(title == title_up) scale_x_reverse() else theme()
+  }
+  
+  # Create plots
+  up_plot <- process_data(up_data, title_up, color_up)
+  down_plot <- process_data(down_data, title_down, color_down)
+  
+  # Combine plots
+  combined_plot <- up_plot + down_plot
+  
+  # Save if output file is provided
+  if (!is.null(output_file)) {
+    ggsave(output_file, combined_plot, width = width, height = height, units = "in")
+  }
+  
+  return(combined_plot)
+}
+
+# Function to perform GSEA analysis
+perform_gsea_analysis <- function(diff_expr_data, gmt_file, output_prefix = NULL) {
+  # Add gene IDs
+  diff_expr_data$ID <- rownames(diff_expr_data)
+  
+  # Extract logFC values
+  exp_fc <- diff_expr_data[, c("ID", "logFC")]
+  logFC <- as.vector(exp_fc[, 2])
+  names(logFC) <- as.vector(exp_fc[, 1])
+  logFC <- sort(logFC, decreasing = TRUE)
+  
+  # Read GMT file
+  gmt <- read.gmt(gmt_file)
+  
+  # Perform GSEA
+  gsea_result <- GSEA(logFC, TERM2GENE = gmt, pvalueCutoff = 0.1)
+  
+  # Format results
+  gsea_table <- as.data.frame(gsea_result)
+  gsea_table <- gsea_table[gsea_table$pvalue < 0.1, ]
+  
+  # Save results if output prefix provided
+  if (!is.null(output_prefix)) {
+    write.table(gsea_table, 
+                file = paste0(output_prefix, "_gsea_result.txt"), 
+                sep = "\t", 
+                quote = FALSE, 
+                row.names = FALSE)
+  }
+  
+  # Create ridge plot
+  ridge_plot <- ridgeplot(gsea_result,
+                         showCategory = 20,
+                         fill = "pvalue",
+                         label_format = 60,
+                         decreasing = TRUE) +
+    scale_fill_gradientn(colors = COLOR_PALETTES$gradient)
+  
+  # Save plot if output prefix provided
+  if (!is.null(output_prefix)) {
+    ggsave(paste0(output_prefix, "_gsea_ridgeplot.pdf"), 
+           ridge_plot, 
+           width = 9, 
+           height = 5, 
+           units = "in", 
+           dpi = 600)
+  }
+  
+  return(list(
+    gsea = gsea_result,
+    table = gsea_table,
+    plot = ridge_plot
+  ))
+}
+
+# Main workflow functions
+run_pathway_analysis <- function(exp_path, cluster_path, pathway_dir, 
+                              output_prefix = "pathway_analysis", method = "wilcox") {
+  # Load data
+  data <- load_expression_data(exp_path, cluster_path)
+  
+  # Perform ssGSEA analysis
+  ssgsea_results <- perform_ssgsea_analysis(
+    data$expression, 
+    pathway_dir, 
+    data$clusters, 
+    method = method
+  )
+  
+  # Create heatmap
+  heatmap <- create_pathway_heatmap(
+    ssgsea_results$significant_scores, 
+    data$sample_order, 
+    ssgsea_results$sample_annotation, 
+    ssgsea_results$significant_annotation, 
+    output_file = paste0("results/", output_prefix, "_heatmap.pdf")
+  )
+  
+  # Save scores
+  write.csv(ssgsea_results$all_scores, 
+            paste0("results/", output_prefix, "_scores.csv"))
+  
+  return(list(
+    data = data,
+    ssgsea = ssgsea_results,
+    heatmap = heatmap
+  ))
+}
+
+run_trn_analysis <- function(exp_path, cluster_path, 
+                         tf_list1, tf_list2, 
+                         output_prefix = "trn_analysis") {
+  # Load data
+  data <- load_expression_data(exp_path, cluster_path)
+  
+  # Analyze TRN
+  trn_results <- analyze_trn(
+    data$expression, 
+    data$sample_order, 
+    data$clusters, 
+    list(tf_list1, tf_list2), 
+    output_file = paste0("results/", output_prefix, "_heatmap.pdf")
+  )
+  
+  return(list(
+    data = data,
+    trn = trn_results
+  ))
+}
+
+run_differential_analysis <- function(exp_path, cluster_path, gmt_file = NULL,
+                                    log2fc_threshold = 2, output_prefix = "differential_analysis") {
+  # Load data
+  data <- load_expression_data(exp_path, cluster_path)
+  
+  # Get common samples
+  common_samples <- intersect(colnames(data$expression), data$clusters$ID)
+  exp_subset <- data$expression[, common_samples]
+  
+  # Perform differential expression analysis
+  diff_results <- analyze_differential_expression(
+    exp_subset, 
+    data$clusters, 
+    output_prefix = paste0("results/", output_prefix)
+  )
+  
+  # Perform KEGG enrichment analysis
+  kegg_results <- perform_kegg_enrichment(
+    diff_results$all_diff, 
+    log2fc_threshold = log2fc_threshold, 
+    output_prefix = paste0("results/", output_prefix)
+  )
+  
+  # Visualize KEGG enrichment
+  kegg_plot <- visualize_enrichment(
+    kegg_results$up, 
+    kegg_results$down, 
+    output_file = paste0("results/", output_prefix, "_kegg_enrichment.pdf")
+  )
+  
+  # Perform GO enrichment analysis
+  go_results <- perform_go_enrichment(
+    diff_results$all_diff, 
+    log2fc_threshold = log2fc_threshold, 
+    output_prefix = paste0("results/", output_prefix)
+  )
+  
+  # Visualize GO enrichment
+  go_plot <- visualize_enrichment(
+    go_results$up, 
+    go_results$down, 
+    output_file = paste0("results/", output_prefix, "_go_enrichment.pdf")
+  )
+  
+  # Perform GSEA analysis if GMT file provided
+  gsea_results <- NULL
+  if (!is.null(gmt_file)) {
+    gsea_results <- perform_gsea_analysis(
+      diff_results$all_diff, 
+      gmt_file, 
+      output_prefix = paste0("results/", output_prefix)
+    )
+  }
+  
+  return(list(
+    data = data,
+    diff = diff_results,
+    kegg = kegg_results,
+    kegg_plot = kegg_plot,
+    go = go_results,
+    go_plot = go_plot,
+    gsea = gsea_results
+  ))
+}
+
+# Example execution
+if (FALSE) {  # Set to TRUE to run
+  # Define paths 
+  exp_path <- "data/tcga.mRNA.exp.txt.gz"
+  cluster_path <- "data/tcga.clust.txt"
+  pathway_dir <- "pathways"
+  gmt_file <- "h.all.v2023.2.Hs.symbols.gmt"
+  
+  # Define TF lists
+  tf_list1 <- c("FOXM1", "EGFR", "KLF4", "STAT3", "RARA", "RXRB", "HIF1A", "FGFR1", "GATA6", 
+               "ESR1", "PGR", "RARB", "RXRA", "RARG", "TP63", "AR", "ERBB2", "ESR2", "GATA3", 
+               "PPARG", "FGFR3", "ERBB3", "FOXA1")
+  
+  tf_list2 <- c("SIRT6", "EHMT2", "KDM5C", "SIRT2", "KAT5", "CLOCK", "KDM5A", "KAT7", "KDM4C", 
+               "CARM1", "NSD2", "HDAC4", "SIRT4", "EP300", "KAТ6B", "KMT2E", "KАТ6A", "SIRT1", 
+               "KDM3B", "KMT2A", "KDM6B", "KMT2C", "PHF8", "HDAC10", "SIRT7", "KAT2A", "KDM4B", 
+               "KDM5D", "NSD3", "HDAC8", "SIRT5", "HDAC6", "KMT2B", "KDM5B", "KMT2D", "HDAC1", 
+               "KDM1A")
+  
+  # Run analyses
+  pathway_results <- run_pathway_analysis(exp_path, cluster_path, pathway_dir)
+  trn_results <- run_trn_analysis(exp_path, cluster_path, tf_list1, tf_list2)
+  diff_results <- run_differential_analysis(exp_path, cluster_path, gmt_file)
+}
