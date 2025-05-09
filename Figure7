@@ -1,0 +1,604 @@
+suppressPackageStartupMessages({
+  library(maftools)
+  library(ggpubr)
+  library(dplyr)
+  library(ggplot2)
+  library(ggrain)
+  library(rstatix)
+  library(gridExtra)
+})
+
+dir.create("results", showWarnings = FALSE)
+
+# Define color schemes
+COLOR_PALETTES <- list(
+  binary = c("#4DBBD5FF", "#E64B35FF"),
+  multi = c("#4DBBD5FF", "#E64B35FF", "#00A087FF", "#3C5488FF", "#F39B7FFF")
+)
+
+# Load and prepare MAF data with cluster information
+prepare_clustered_maf <- function(maf_path, cluster_path) {
+  # Read MAF file
+  maf <- read.maf(maf_path)
+  
+  # Read clustering information
+  clusters <- read.delim(cluster_path, header = TRUE, stringsAsFactors = FALSE)
+  
+  # Get clinical data from MAF
+  clinical <- getClinicalData(maf)
+  
+  # Extract sample IDs (first 15 characters)
+  clinical$Sample_ID_Short <- substr(clinical$Tumor_Sample_Barcode, 1, 15)
+  
+  # Match cluster groups to samples
+  clinical$Group <- clusters$Group[match(clinical$Sample_ID_Short, clusters$ID)]
+  
+  # Remove samples without group assignment and sort by group
+  clinical <- clinical %>% 
+    na.omit() %>%
+    arrange(Group)
+  
+  # Update MAF clinical data
+  maf@clinical.data <- clinical
+  
+  # Subset MAF to include only samples with group assignments
+  maf_grouped <- subsetMaf(maf, tsb = clinical$Tumor_Sample_Barcode[!is.na(clinical$Group)])
+  
+  # Get sample IDs for each group
+  group_names <- unique(clinical$Group)
+  group_samples <- lapply(group_names, function(group) {
+    clinical$Tumor_Sample_Barcode[clinical$Group == group]
+  })
+  names(group_samples) <- group_names
+  
+  # Create MAF subsets for each group
+  maf_groups <- lapply(group_names, function(group) {
+    subsetMaf(maf = maf_grouped, tsb = group_samples[[group]])
+  })
+  names(maf_groups) <- group_names
+  
+  # Return list of results
+  return(list(
+    full_maf = maf,
+    grouped_maf = maf_grouped,
+    group_mafs = maf_groups,
+    group_names = group_names,
+    group_samples = group_samples,
+    clinical = clinical
+  ))
+}
+
+# Perform MAF comparison and create forest plot
+analyze_differential_mutations <- function(maf_data, pvalue_threshold = 0.05, 
+                                         top_n = 20, custom_gene = NULL,
+                                         output_prefix = "diff_mutations") {
+  # Extract group MAFs
+  maf_group1 <- maf_data$group_mafs[[1]]
+  maf_group2 <- maf_data$group_mafs[[2]]
+  group1_name <- maf_data$group_names[1]
+  group2_name <- maf_data$group_names[2]
+  
+  # Perform MAF comparison
+  maf_compare <- mafCompare(
+    m1 = maf_group1, 
+    m2 = maf_group2, 
+    m1Name = group1_name, 
+    m2Name = group2_name
+  )
+  
+  # Filter results
+  filtered_results <- maf_compare
+  filtered_results$results <- maf_compare$results[!is.infinite(maf_compare$results$or), ]
+  filtered_results$results <- filtered_results$results[filtered_results$results$pval < pvalue_threshold, ]
+  
+  # Select top mutations by p-value
+  if(nrow(filtered_results$results) > 0) {
+    # Select top N genes
+    top_genes <- filtered_results$results[1:min(top_n-1, nrow(filtered_results$results)), ]
+    
+    # If custom gene is specified, add it to the results
+    if(!is.null(custom_gene) && custom_gene %in% maf_compare$results$Hugo_Symbol) {
+      custom_gene_row <- which(maf_compare$results$Hugo_Symbol == custom_gene)
+      if(length(custom_gene_row) > 0 && !custom_gene %in% top_genes$Hugo_Symbol) {
+        final_genes <- rbind(top_genes, maf_compare$results[custom_gene_row, ])
+      } else {
+        final_genes <- top_genes
+      }
+    } else {
+      final_genes <- top_genes
+    }
+    
+    # Create final filtered results
+    final_results <- maf_compare
+    final_results$results <- final_genes
+    
+    # Create forest plot
+    pdf(file.path("results", paste0(output_prefix, "_forest_plot.pdf")), width = 8, height = 6)
+    forestPlot(mafCompareRes = final_results, pVal = pvalue_threshold)
+    dev.off()
+    
+    # Prepare formatted results for export
+    result_df <- data.frame(
+      Gene = final_results$results$Hugo_Symbol,
+      Group1_Freq = final_results$results$M1_Freq,
+      Group2_Freq = final_results$results$M2_Freq,
+      Odds_Ratio = final_results$results$or,
+      CI_Lower = final_results$results$ci.lower,
+      CI_Upper = final_results$results$ci.upper,
+      P_value = final_results$results$pval,
+      FDR = final_results$results$adjPval
+    )
+    
+    # Set column names to actual group names
+    colnames(result_df)[2:3] <- c(
+      paste0(group1_name, "_Freq"),
+      paste0(group2_name, "_Freq")
+    )
+    
+    # Export results
+    write.csv(result_df, file.path("results", paste0(output_prefix, "_results.csv")), row.names = FALSE)
+    
+    return(list(
+      comparison = maf_compare,
+      filtered = filtered_results,
+      final = final_results,
+      results_df = result_df
+    ))
+  } else {
+    message("No significant differential mutations found with p < ", pvalue_threshold)
+    return(NULL)
+  }
+}
+
+# Generate co-barplot of top mutated genes
+analyze_top_mutations <- function(maf_data, top_n = 20, custom_genes = NULL, output_prefix = "top_mutations") {
+  # Extract group MAFs
+  maf_group1 <- maf_data$group_mafs[[1]]
+  maf_group2 <- maf_data$group_mafs[[2]]
+  group1_name <- maf_data$group_names[1]
+  group2_name <- maf_data$group_names[2]
+  
+  # Function to get top mutated genes
+  get_top_mutated_genes <- function(maf, n = top_n) {
+    gene_summary <- getGeneSummary(maf)
+    top_genes <- head(gene_summary$Hugo_Symbol, n)
+    return(top_genes)
+  }
+  
+  # Get top genes from each group
+  top_genes_group1 <- get_top_mutated_genes(maf_group1)
+  top_genes_group2 <- get_top_mutated_genes(maf_group2)
+  
+  # Combine and filter genes
+  all_top_genes <- unique(c(top_genes_group1, top_genes_group2))
+  if(length(all_top_genes) > top_n) {
+    all_top_genes <- all_top_genes[1:top_n]
+  }
+  
+  # Add custom genes if specified
+  if(!is.null(custom_genes)) {
+    all_top_genes <- unique(c(all_top_genes, custom_genes))
+  }
+  
+  # Create co-barplot
+  pdf(file.path("results", paste0(output_prefix, "_barplot.pdf")), width = 12, height = 8)
+  coBarplot(
+    m1 = maf_group1, 
+    m2 = maf_group2, 
+    m1Name = group1_name, 
+    m2Name = group2_name,
+    genes = all_top_genes
+  )
+  dev.off()
+  
+  # Function to get mutation frequencies
+  get_mutation_frequencies <- function(maf, genes) {
+    # Get total sample count
+    total_samples <- length(unique(maf@clinical.data$Tumor_Sample_Barcode))
+    
+    # Get samples with mutations in each gene
+    gene_summary <- getGeneSummary(maf)
+    gene_freqs <- gene_summary[gene_summary$Hugo_Symbol %in% genes,
+                             c("Hugo_Symbol", "MutatedSamples")]
+    
+    # Calculate frequency
+    gene_freqs$Frequency <- gene_freqs$MutatedSamples / total_samples * 100
+    
+    return(gene_freqs)
+  }
+  
+  # Get mutation frequencies for each group
+  freq_group1 <- get_mutation_frequencies(maf_group1, all_top_genes)
+  freq_group2 <- get_mutation_frequencies(maf_group2, all_top_genes)
+  
+  # Create results dataframe
+  mutation_data <- data.frame(
+    Gene = all_top_genes,
+    Group1_MutatedSamples = freq_group1$MutatedSamples[match(all_top_genes, freq_group1$Hugo_Symbol)],
+    Group1_Frequency = freq_group1$Frequency[match(all_top_genes, freq_group1$Hugo_Symbol)],
+    Group2_MutatedSamples = freq_group2$MutatedSamples[match(all_top_genes, freq_group2$Hugo_Symbol)],
+    Group2_Frequency = freq_group2$Frequency[match(all_top_genes, freq_group2$Hugo_Symbol)]
+  )
+  
+  # Set column names to actual group names
+  colnames(mutation_data)[c(2,4)] <- c(
+    paste0(group1_name, "_MutatedSamples"),
+    paste0(group2_name, "_MutatedSamples")
+  )
+  colnames(mutation_data)[c(3,5)] <- c(
+    paste0(group1_name, "_Frequency"),
+    paste0(group2_name, "_Frequency")
+  )
+  
+  # Sort by frequency of first group
+  mutation_data <- mutation_data[order(-mutation_data[, paste0(group1_name, "_Frequency")]), ]
+  
+  # Export results
+  write.csv(mutation_data, 
+           file.path("results", paste0(output_prefix, "_frequency.csv")), 
+           row.names = FALSE)
+  
+  return(list(
+    top_genes = all_top_genes,
+    frequencies = mutation_data
+  ))
+}
+
+# Generate lollipop plot for specific genes
+analyze_gene_structure <- function(maf_data, genes, output_prefix = "gene_structure") {
+  # Extract group MAFs
+  maf_group1 <- maf_data$group_mafs[[1]]
+  maf_group2 <- maf_data$group_mafs[[2]]
+  group1_name <- maf_data$group_names[1]
+  group2_name <- maf_data$group_names[2]
+  
+  # Create lollipop plots for each gene
+  if(length(genes) > 0) {
+    for(gene in genes) {
+      pdf(file.path("results", paste0(output_prefix, "_", gene, ".pdf")), width = 10, height = 5)
+      lollipopPlot2(
+        m1 = maf_group1, 
+        m2 = maf_group2, 
+        gene = gene, 
+        AACol1 = "HGVSp_Short", 
+        AACol2 = "HGVSp_Short", 
+        m1_name = group1_name, 
+        m2_name = group2_name
+      )
+      dev.off()
+    }
+  }
+  
+  return(genes)
+}
+
+# Analyze tumor mutation burden (TMB)
+analyze_tmb <- function(maf_data, capture_size = 50, use_log_scale = TRUE, output_prefix = "tmb") {
+  # Extract group MAFs
+  maf_group1 <- maf_data$group_mafs[[1]]
+  maf_group2 <- maf_data$group_mafs[[2]]
+  group1_name <- maf_data$group_names[1]
+  group2_name <- maf_data$group_names[2]
+  
+  # Calculate TMB for both groups
+  tmb_group1 <- tmb(maf_group1, captureSize = capture_size, logScale = use_log_scale)
+  tmb_group2 <- tmb(maf_group2, captureSize = capture_size, logScale = use_log_scale)
+  
+  # Customize titles
+  tmb_group1$labels$title <- paste0(group1_name, " (n=", length(tmb_group1$data$total_perMB), ")")
+  tmb_group2$labels$title <- paste0(group2_name, " (n=", length(tmb_group2$data$total_perMB), ")")
+  
+  # Create combined plot
+  pdf(file.path("results", paste0(output_prefix, "_boxplots.pdf")), width = 12, height = 6)
+  gridExtra::grid.arrange(tmb_group1, tmb_group2, ncol = 2)
+  dev.off()
+  
+  # Prepare data for rain plot
+  combined_data <- rbind(
+    data.frame(
+      Sample = rownames(tmb_group1$data), 
+      TMB = tmb_group1$data$total_perMB_log, 
+      Group = group1_name
+    ),
+    data.frame(
+      Sample = rownames(tmb_group2$data), 
+      TMB = tmb_group2$data$total_perMB_log, 
+      Group = group2_name
+    )
+  )
+  
+  # Perform statistical test
+  stat_test <- combined_data %>% 
+    wilcox_test(TMB ~ Group) %>% 
+    add_significance()
+  
+  # Format p-value
+  p_value <- stat_test$p
+  p_value_formatted <- if(p_value < 0.0001) {
+    formatC(p_value, format = "e", digits = 2)
+  } else {
+    sprintf("%.4f", p_value)
+  }
+  
+  # Create rain plot
+  p <- ggplot(combined_data, aes(Group, TMB, fill = Group)) +
+    geom_rain(alpha = .5) +
+    theme_test() +
+    scale_fill_manual(values = COLOR_PALETTES$binary) +
+    labs(x = "", y = "TMB/MB (log10)") +
+    ggsignif::geom_signif(
+      comparisons = list(c(group1_name, group2_name)),
+      test = "wilcox.test",
+      map_signif_level = function(p) sprintf("P = %s", p_value_formatted),
+      size = 1,
+      textsize = 4
+    ) +
+    theme(
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 14),
+      plot.title = element_text(size = 16, hjust = 0.5)
+    )
+  
+  # Save plot
+  ggsave(file.path("results", paste0(output_prefix, "_rainplot.pdf")), 
+        p, width = 5, height = 5)
+  
+  # Create and export results table
+  tmb_results <- data.frame(
+    Group = c(rep(group1_name, nrow(tmb_group1$data)), 
+             rep(group2_name, nrow(tmb_group2$data))),
+    Sample = c(rownames(tmb_group1$data), rownames(tmb_group2$data)),
+    TMB_raw = c(tmb_group1$data$total_perMB, tmb_group2$data$total_perMB),
+    TMB_log = c(tmb_group1$data$total_perMB_log, tmb_group2$data$total_perMB_log),
+    Total_Mutations = c(tmb_group1$data$total, tmb_group2$data$total)
+  )
+  
+  write.csv(tmb_results, 
+           file.path("results", paste0(output_prefix, "_data.csv")), 
+           row.names = FALSE)
+  
+  # Calculate summary statistics
+  tmb_summary <- combined_data %>%
+    group_by(Group) %>%
+    summarize(
+      n = n(),
+      mean = mean(TMB),
+      median = median(TMB),
+      sd = sd(TMB),
+      min = min(TMB),
+      max = max(TMB)
+    ) %>%
+    mutate(stats_test = if_else(row_number() == 1, 
+                              paste0("Wilcoxon p-value: ", p_value_formatted), 
+                              ""))
+  
+  write.csv(tmb_summary, 
+           file.path("results", paste0(output_prefix, "_summary.csv")), 
+           row.names = FALSE)
+  
+  return(list(
+    data = combined_data,
+    test = stat_test,
+    summary = tmb_summary,
+    plot = p
+  ))
+}
+
+# Analyze somatic interactions
+analyze_somatic_interactions <- function(maf_data, top_n = 20, 
+                                       pvalue_thresholds = c(0.01, 0.05),
+                                       output_prefix = "somatic_interactions") {
+  # Function to analyze and save interactions
+  analyze_single_maf <- function(maf_object, name) {
+    # Generate plot
+    pdf(file.path("results", paste0(output_prefix, "_", name, ".pdf")), 
+       width = 12, height = 10)
+    interactions <- somaticInteractions(
+      maf = maf_object, 
+      top = top_n, 
+      pvalue = pvalue_thresholds,
+      colPal = "PRGn"
+    )
+    dev.off()
+    
+    # Create data frame from results
+    if(!is.null(interactions)) {
+      interaction_df <- data.frame(
+        Gene1 = interactions$gene1,
+        Gene2 = interactions$gene2,
+        P_value = interactions$pValue,
+        Odds_Ratio = interactions$oddsRatio,
+        Neither = interactions$`00`,
+        Gene2_Only = interactions$`01`,
+        Both = interactions$`11`,
+        Gene1_Only = interactions$`10`,
+        Adjusted_P = interactions$pAdj,
+        Event_Type = interactions$Event,
+        stringsAsFactors = FALSE
+      )
+      
+      # Save to CSV
+      write.csv(interaction_df, 
+               file.path("results", paste0(output_prefix, "_", name, ".csv")), 
+               row.names = FALSE)
+      
+      return(list(
+        interactions = interactions,
+        data = interaction_df
+      ))
+    } else {
+      return(NULL)
+    }
+  }
+  
+  # Analyze all datasets
+  results <- list()
+  
+  # Full dataset
+  results$all <- analyze_single_maf(maf_data$grouped_maf, "all")
+  
+  # Individual groups
+  for(i in seq_along(maf_data$group_names)) {
+    group_name <- maf_data$group_names[i]
+    results[[group_name]] <- analyze_single_maf(maf_data$group_mafs[[i]], group_name)
+  }
+  
+  return(results)
+}
+
+# Analyze mutation impact on survival
+analyze_mutation_survival <- function(maf_data, genes, 
+                                    time_col = "days_to_last_followup",
+                                    status_col = "Overall_Survival_Status",
+                                    is_tcga = TRUE,
+                                    output_prefix = "mutation_survival") {
+  # Function to analyze a single MAF
+  analyze_single_maf <- function(maf_object, name, gene) {
+    pdf(file.path("results", paste0(output_prefix, "_", gene, "_", name, ".pdf")), 
+       width = 6, height = 6)
+    result <- mafSurvival(
+      maf = maf_object, 
+      genes = gene, 
+      time = time_col, 
+      Status = status_col, 
+      isTCGA = is_tcga
+    )
+    dev.off()
+    
+    return(result)
+  }
+  
+  # Analyze each gene across all datasets
+  results <- list()
+  
+  for(gene in genes) {
+    gene_results <- list()
+    
+    # Full dataset
+    gene_results$all <- analyze_single_maf(maf_data$grouped_maf, "all", gene)
+    
+    # Individual groups
+    for(i in seq_along(maf_data$group_names)) {
+      group_name <- maf_data$group_names[i]
+      gene_results[[group_name]] <- analyze_single_maf(maf_data$group_mafs[[i]], group_name, gene)
+    }
+    
+    results[[gene]] <- gene_results
+  }
+  
+  return(results)
+}
+
+# Analyze gene sets associated with survival
+analyze_genesets_survival <- function(maf_data, top_n = 20, geneset_size = 2,
+                                    time_col = "days_to_last_followup",
+                                    status_col = "Overall_Survival_Status",
+                                    output_prefix = "geneset_survival") {
+  # Function to analyze a single MAF
+  analyze_single_maf <- function(maf_object, name) {
+    pdf(file.path("results", paste0(output_prefix, "_", name, ".pdf")), 
+       width = 8, height = 6)
+    result <- survGroup(
+      maf = maf_object, 
+      top = top_n, 
+      geneSetSize = geneset_size, 
+      time = time_col, 
+      Status = status_col, 
+      verbose = FALSE
+    )
+    plot(result)
+    dev.off()
+    
+    return(result)
+  }
+  
+  # Analyze all datasets
+  results <- list()
+  
+  # Full dataset
+  results$all <- analyze_single_maf(maf_data$grouped_maf, "all")
+  
+  # Individual groups
+  for(i in seq_along(maf_data$group_names)) {
+    group_name <- maf_data$group_names[i]
+    results[[group_name]] <- analyze_single_maf(maf_data$group_mafs[[i]], group_name)
+  }
+  
+  return(results)
+}
+
+# Run the complete analysis workflow
+run_comprehensive_analysis <- function(maf_path, cluster_path, 
+                                     genes_of_interest = NULL,
+                                     top_n_mutations = 20,
+                                     pvalue_threshold = 0.05) {
+  # Prepare MAF data
+  maf_data <- prepare_clustered_maf(maf_path, cluster_path)
+  
+  # Run differential mutation analysis
+  diff_muts <- analyze_differential_mutations(
+    maf_data, 
+    pvalue_threshold = pvalue_threshold,
+    top_n = top_n_mutations,
+    custom_gene = if(!is.null(genes_of_interest)) genes_of_interest[1] else NULL
+  )
+  
+  # Analyze top mutations
+  top_muts <- analyze_top_mutations(
+    maf_data,
+    top_n = top_n_mutations,
+    custom_genes = genes_of_interest
+  )
+  
+  # Generate gene structure plots
+  if(!is.null(genes_of_interest)) {
+    gene_structs <- analyze_gene_structure(
+      maf_data,
+      genes = genes_of_interest
+    )
+  }
+  
+  # Analyze TMB
+  tmb_results <- analyze_tmb(maf_data)
+  
+  # Analyze somatic interactions
+  interact_results <- analyze_somatic_interactions(maf_data)
+  
+  # Analyze mutation impact on survival
+  if(!is.null(genes_of_interest)) {
+    surv_results <- analyze_mutation_survival(
+      maf_data,
+      genes = genes_of_interest
+    )
+  }
+  
+  # Analyze gene sets associated with survival
+  geneset_results <- analyze_genesets_survival(maf_data)
+  
+  # Return all results
+  return(list(
+    maf_data = maf_data,
+    differential_mutations = diff_muts,
+    top_mutations = top_muts,
+    tmb = tmb_results,
+    somatic_interactions = interact_results,
+    geneset_survival = geneset_results,
+    gene_survival = if(exists("surv_results")) surv_results else NULL,
+    gene_structures = if(exists("gene_structs")) gene_structs else NULL
+  ))
+}
+
+# Example usage (commented out)
+if (FALSE) {
+  # Define paths and parameters
+  maf_path <- "data/ESCA_merge.masked.somatic.mutation.maf"
+  cluster_path <- "data/tcga.clust.txt"
+  genes_of_interest <- c("ZNF750", "TP53", "DNMT3A")
+  
+  # Run analysis
+  results <- run_comprehensive_analysis(
+    maf_path = maf_path,
+    cluster_path = cluster_path,
+    genes_of_interest = genes_of_interest
+  )
+}
