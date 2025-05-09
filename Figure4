@@ -1,0 +1,525 @@
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(plyr)
+  library(ggplot2)
+  library(IOBR)
+  library(pheatmap)
+  library(gridExtra)
+})
+
+dir.create("results", showWarnings = FALSE)
+
+# Clinical correlation analysis function
+analyze_clinical_factor <- function(merged_data, factor_name, group_name = "Group", 
+                                   grouping_function = NULL, filter_values = NULL, 
+                                   colors = NULL, test_method = "fisher.test",
+                                   plot_title = "", output_prefix = "") {
+  
+  # Create a copy of data
+  data_subset <- merged_data
+  
+  # Remove empty values
+  data_subset[[factor_name]][data_subset[[factor_name]] == ""] <- NA
+  
+  # Apply grouping function if provided
+  if (!is.null(grouping_function)) {
+    data_subset[[paste0(factor_name, "_group")]] <- grouping_function(data_subset[[factor_name]])
+    trait_col <- paste0(factor_name, "_group")
+  } else {
+    trait_col <- factor_name
+  }
+  
+  # Filter values if needed
+  if (!is.null(filter_values)) {
+    data_subset <- data_subset[data_subset[[trait_col]] %in% filter_values, ]
+  }
+  
+  # Extract data for analysis
+  analysis_data <- data_subset[, c(trait_col, group_name)]
+  colnames(analysis_data) <- c("trait", "group")
+  
+  # Calculate frequency table
+  freq_df <- as.data.frame(table(analysis_data))
+  
+  # Calculate p-value
+  stat_table <- table(analysis_data)
+  if (test_method == "fisher.test") {
+    stat_result <- fisher.test(stat_table)
+  } else if (test_method == "chisq.test") {
+    stat_result <- chisq.test(stat_table)
+  } else {
+    stop("Unknown test method")
+  }
+  
+  p_value <- ifelse(stat_result$p.value < 0.0001, 
+                    "P<0.0001", 
+                    paste0("P=", sprintf("%.03f", stat_result$p.value)))
+  
+  # Calculate percentages
+  freq_df <- ddply(freq_df, .(group), transform,
+                  percent = Freq/sum(Freq) * 100,
+                  pos = (cumsum(Freq) - 0.5 * Freq))
+  
+  freq_df$label <- paste0(sprintf("%.0f", freq_df$percent), "%")
+  
+  # Set default colors if not provided
+  if (is.null(colors)) {
+    colors <- c("#3288bd", "#66c2a5", "#ffffbf", "#f46d43", "#9e0142")
+  }
+  
+  # Plot
+  p <- ggplot(freq_df, aes(x = factor(group), y = percent, fill = trait)) +
+    geom_bar(position = position_stack(), stat = "identity", width = .7) +
+    scale_fill_manual(values = colors) +
+    xlab("") + ylab("Percent weight") +
+    guides(fill = guide_legend(title = ifelse(plot_title == "", factor_name, plot_title))) +
+    geom_text(aes(label = label), position = position_stack(vjust = 0.5), size = 3) +
+    annotate("text", x = 1.5, y = 106, 
+             label = paste0(ifelse(test_method == "fisher.test", "Fisher.test", "Chi-square test"), 
+                           ", ", p_value), size = 6) +
+    theme_test() +
+    theme(panel.background = element_rect(fill = "#f3f4f4"))
+  
+  # Save plot
+  if (output_prefix != "") {
+    ggsave(paste0("results/", output_prefix, "_percent_barplot.pdf"), p, width = 4.5, height = 5)
+    
+    # Save analysis results
+    write.table(freq_df, 
+               file = paste0("results/", output_prefix, "_analysis_results.txt"), 
+               sep = "\t", col.names = TRUE, quote = FALSE, row.names = FALSE)
+  }
+  
+  return(list(plot = p, data = freq_df, p_value = stat_result$p.value))
+}
+
+# Load and merge clinical and cluster data
+load_clinical_data <- function(clinical_path, cluster_path) {
+  clinical_data <- read.delim(clinical_path, header = TRUE, stringsAsFactors = FALSE)
+  cluster_data <- read.delim(cluster_path, header = TRUE, stringsAsFactors = FALSE)
+  
+  merged_data <- merge(clinical_data, cluster_data, by.x = "Samples", by.y = "ID", all.x = TRUE)
+  return(merged_data)
+}
+
+# Run all clinical analyses
+run_clinical_analyses <- function(clinical_path, cluster_path) {
+  merged_data <- load_clinical_data(clinical_path, cluster_path)
+  
+  # Age analysis
+  age_result <- analyze_clinical_factor(
+    merged_data = merged_data,
+    factor_name = "Age",
+    grouping_function = function(x) ifelse(as.numeric(x) > 65, ">65", "≤65"),
+    colors = c("#3288bd", "#66c2a5", "#ffffbf", "#f46d43", "#9e0142"),
+    plot_title = "Age",
+    output_prefix = "age"
+  )
+  
+  # Gender analysis
+  gender_result <- analyze_clinical_factor(
+    merged_data = merged_data,
+    factor_name = "Gender",
+    colors = c("#ffffbf", "#f46d43"),
+    plot_title = "Gender",
+    output_prefix = "gender"
+  )
+  
+  # AJCC_M analysis
+  m_result <- analyze_clinical_factor(
+    merged_data = merged_data,
+    factor_name = "AJCC_M",
+    filter_values = c("M0", "M1"),
+    colors = c("#33429B", "#3AC2EB"),
+    plot_title = "M",
+    output_prefix = "m_stage"
+  )
+  
+  # AJCC_N analysis (grouped)
+  n_grouped_result <- analyze_clinical_factor(
+    merged_data = merged_data,
+    factor_name = "AJCC_N",
+    grouping_function = function(x) ifelse(x %in% c("N2", "N3"), "N2/N3", 
+                                         ifelse(x %in% c("N0", "N1"), "N0/N1", x)),
+    filter_values = c("N0/N1", "N2/N3"),
+    colors = c("#f2ccac", "#0eb0c8"),
+    plot_title = "AJCC_N group",
+    output_prefix = "n_stage_grouped"
+  )
+  
+  # AJCC_Stage analysis (grouped)
+  stage_grouped_result <- analyze_clinical_factor(
+    merged_data = merged_data,
+    factor_name = "AJCC_Stage",
+    grouping_function = function(x) ifelse(x %in% c("IV", "III"), "III/IV",
+                                         ifelse(x %in% c("I", "II"), "I/II", x)),
+    filter_values = c("I/II", "III/IV"),
+    colors = c("#3C5488FF", "#F39B7FFF"),
+    plot_title = "AJCC_Stage group",
+    output_prefix = "stage_grouped"
+  )
+  
+  # AJCC_T analysis (grouped)
+  t_grouped_result <- analyze_clinical_factor(
+    merged_data = merged_data,
+    factor_name = "AJCC_T",
+    grouping_function = function(x) ifelse(x %in% c("T1", "T2"), "T1/T2", "T3/T4"),
+    colors = c("#8491B4FF", "#91D1C2FF"),
+    test_method = "chisq.test",
+    plot_title = "AJCC_T group",
+    output_prefix = "t_stage_grouped"
+  )
+  
+  # Diagnosis analysis
+  diagnosis_result <- analyze_clinical_factor(
+    merged_data = merged_data,
+    factor_name = "Diagnosis",
+    colors = c("#AADCE0", "#FFE6B7"),
+    plot_title = "Diagnosis",
+    output_prefix = "diagnosis"
+  )
+  
+  # AJCC_N analysis (detailed)
+  n_detailed_result <- analyze_clinical_factor(
+    merged_data = merged_data,
+    factor_name = "AJCC_N",
+    filter_values = c("N0", "N1", "N2", "N3"),
+    colors = c("#3288bd", "#66c2a5", "#f46d43", "#9e0142"),
+    plot_title = "N",
+    output_prefix = "n_stage_detailed"
+  )
+  
+  # AJCC_Stage analysis (detailed)
+  stage_detailed_result <- analyze_clinical_factor(
+    merged_data = merged_data,
+    factor_name = "AJCC_Stage",
+    colors = c("#3C5488FF", "#AADCE0", "#FFE6B7", "#F39B7FFF"),
+    plot_title = "Stage",
+    output_prefix = "stage_detailed"
+  )
+  
+  # AJCC_T analysis (detailed)
+  t_detailed_result <- analyze_clinical_factor(
+    merged_data = merged_data,
+    factor_name = "AJCC_T",
+    filter_values = c("T1", "T2", "T3", "T4"),
+    colors = c("#3288bd", "#66c2a5", "#ffffbf", "#f46d43"),
+    plot_title = "T",
+    output_prefix = "t_stage_detailed"
+  )
+  
+  return(list(
+    age = age_result,
+    gender = gender_result,
+    m_stage = m_result,
+    n_stage_grouped = n_grouped_result,
+    stage_grouped = stage_grouped_result,
+    t_stage_grouped = t_grouped_result,
+    diagnosis = diagnosis_result,
+    n_stage_detailed = n_detailed_result,
+    stage_detailed = stage_detailed_result,
+    t_stage_detailed = t_detailed_result
+  ))
+}
+
+# Process RNA-seq data for immune infiltration analysis
+process_rna_data <- function(mrna_path) {
+  mRNA_data <- read.delim(mrna_path, row.names = 1, check.names = FALSE)
+  mRNA_data <- mRNA_data[, -1]
+  
+  # Process duplicate Symbols and use as row names
+  rownames(mRNA_data) <- make.unique(mRNA_data$Symbol)
+  mRNA_data <- mRNA_data[, -1]
+  
+  # Select tumor samples
+  tumor_samples <- grep("01A", colnames(mRNA_data), fixed = TRUE, value = TRUE)
+  mRNA_data <- mRNA_data[, tumor_samples]
+  
+  # Truncate sample names and log transform
+  colnames(mRNA_data) <- substr(colnames(mRNA_data), 1, 15)
+  mRNA_data <- log2(mRNA_data + 1)
+  
+  # Write processed data
+  write.csv(mRNA_data, 'results/mRNA_data_log2TPM_plus_1.csv')
+  
+  return(mRNA_data)
+}
+
+# Calculate immune infiltration scores
+calculate_immune_infiltration <- function(exp_data, sample_list_path = NULL) {
+  # Filter data to include only samples in sample_list if provided
+  if (!is.null(sample_list_path)) {
+    sample_list <- read.delim(sample_list_path, header = TRUE, stringsAsFactors = FALSE)
+    sample_names <- sample_list[, 1]
+    exp_data <- exp_data[, colnames(exp_data) %in% sample_names]
+  }
+  
+  # Calculate immune infiltration using multiple methods
+  cibersort <- deconvo_tme(eset = exp_data, method = "cibersort", arrays = FALSE, perm = 10)
+  epic <- deconvo_tme(eset = exp_data, method = "epic", arrays = FALSE)
+  mcp <- deconvo_tme(eset = exp_data, method = "mcpcounter")
+  xcell <- deconvo_tme(eset = exp_data, method = "xcell", arrays = FALSE)
+  estimate <- deconvo_tme(eset = exp_data, method = "estimate")
+  timer <- deconvo_tme(eset = exp_data, method = "timer", group_list = rep("uvm", dim(exp_data)[2]))
+  quantiseq <- deconvo_tme(eset = exp_data, method = "quantiseq", tumor = TRUE, arrays = FALSE, scale_mrna = TRUE)
+  
+  # Combine all results
+  tme_combine <- cibersort %>% 
+    inner_join(mcp, "ID") %>% 
+    inner_join(xcell, "ID") %>%
+    inner_join(epic, "ID") %>% 
+    inner_join(estimate, "ID") %>% 
+    inner_join(timer, "ID") %>% 
+    inner_join(quantiseq, "ID")
+  
+  # Filter by CIBERSORT p-value
+  tme_combine <- tme_combine[tme_combine$P.value_CIBERSORT < 0.05, ]
+  
+  # Remove unnecessary columns
+  tme_combine1 <- tme_combine[, !names(tme_combine) %in% c("P-value_CIBERSORT", "Correlation_CIBERSORT", "RMSE_CIBERSORT", "Other_quantiseq")]
+  
+  # Set row names and convert to numeric
+  rownames(tme_combine1) <- tme_combine1$ID
+  tme_combine1 <- tme_combine1[, -1]
+  tme_combine1[] <- lapply(tme_combine1, as.numeric)
+  
+  # Scale data
+  tme_combine2 <- scale(tme_combine1, center = TRUE, scale = TRUE)
+  tme_combine2 <- as.data.frame(t(tme_combine2))
+  tme_combine2 <- na.omit(tme_combine2)
+  
+  write.csv(tme_combine, 'results/tme_combine_raw.csv', row.names = FALSE)
+  write.csv(tme_combine2, 'results/tme_combine_scaled.csv')
+  
+  return(tme_combine2)
+}
+
+# Generate immune cell heatmap
+generate_immune_heatmap <- function(tme_data, cluster_path, output_dir = "results", 
+                                  significance_filter = TRUE) {
+  # Load cluster data
+  cluster_data <- read.delim(cluster_path, header = TRUE, stringsAsFactors = FALSE)
+  
+  # Extract subset of cluster data
+  cluster_data_subset <- cluster_data[, c("ID", "Group")]
+  
+  # Find common samples
+  common_samples <- intersect(cluster_data_subset$ID, colnames(tme_data))
+  
+  # Filter data
+  cluster_data_subset <- cluster_data_subset[cluster_data_subset$ID %in% common_samples, ]
+  tme_data_subset <- tme_data[, colnames(tme_data) %in% common_samples]
+  
+  # Extract group info
+  group_info <- cluster_data_subset$Group
+  
+  # Sort data by cluster data ID
+  tme_data_sorted <- tme_data_subset[, match(cluster_data_subset$ID, colnames(tme_data_subset))]
+  
+  # Create annotation dataframe
+  annotation_col_df <- data.frame(Group = group_info)
+  rownames(annotation_col_df) <- colnames(tme_data_sorted)
+  
+  # Sort by group
+  group_order <- order(group_info)
+  tme_data_sorted <- tme_data_sorted[, group_order]
+  annotation_col_df <- annotation_col_df[group_order, , drop = FALSE]
+  
+  # Extract method info
+  method_info <- gsub(".*_", "", rownames(tme_data_sorted))
+  
+  # Calculate p-values between groups
+  p_values <- apply(tme_data_sorted, 1, function(row) {
+    wilcox.test(row ~ group_info[group_order])$p.value
+  })
+  
+  # Filter by significance if requested
+  if (significance_filter) {
+    significant_rows <- p_values < 0.05
+    tme_data_sorted <- tme_data_sorted[significant_rows, ]
+    p_values <- p_values[significant_rows]
+    method_info <- method_info[significant_rows]
+  }
+  
+  # Format p-values
+  formatted_p_values <- ifelse(p_values < 0.0001, 
+                             "P<0.0001", 
+                             paste0("P=", sprintf("%.4f", p_values)))
+  
+  # Create row names with p-values
+  row_names_with_p <- paste0(rownames(tme_data_sorted), " (", formatted_p_values, ")")
+  
+  # Create row annotation
+  annotation_row_df <- data.frame(Method = method_info)
+  rownames(annotation_row_df) <- row_names_with_p
+  
+  # Sort by method
+  method_order <- order(method_info)
+  tme_data_sorted <- tme_data_sorted[method_order, ]
+  annotation_row_df <- annotation_row_df[method_order, , drop = FALSE]
+  row_names_with_p <- row_names_with_p[method_order]
+  
+  # Define splits for visualization
+  method_split <- c(0, cumsum(table(method_info)))
+  group_split <- c(0, cumsum(table(group_info)))
+  
+  # Define colors
+  group_colors <- c("#4DBBD5FF", "#E64B35FF")
+  names(group_colors) <- unique(group_info)
+  
+  method_colors <- c("#33429B", "#3AC2EB", "#A4D283", "#F8ED30", "#F79368", "#D51A65", "#B31F24")
+  names(method_colors) <- unique(method_info)
+  
+  # Generate heatmap
+  p <- pheatmap(
+    tme_data_sorted,
+    border_color = NA,
+    color = colorRampPalette(c(rep("#1F66AC", 1), "white", rep("#f46d43", 4)))(100),
+    cluster_rows = !significance_filter,
+    treeheight_row = 0,
+    cluster_cols = FALSE,
+    show_rownames = TRUE,
+    show_colnames = FALSE,
+    annotation_col = annotation_col_df,
+    annotation_row = annotation_row_df,
+    gaps_row = method_split,
+    gaps_col = group_split,
+    annotation_colors = list(Group = group_colors, Method = method_colors),
+    labels_row = row_names_with_p
+  )
+  
+  # Save heatmap
+  suffix <- if(significance_filter) "_significant" else "_all"
+  pdf(file.path(output_dir, paste0("immune_infiltration_heatmap", suffix, ".pdf")), 
+     width = if(significance_filter) 12 else 10, 
+     height = if(significance_filter) 12 else 20)
+  print(p)
+  dev.off()
+  
+  # Generate differential expression results
+  result_df <- data.frame(
+    Pathway = rownames(tme_data_sorted),
+    C1_mean = rowMeans(tme_data_sorted[, group_info[group_order] == "C1", drop = FALSE]),
+    C2_mean = rowMeans(tme_data_sorted[, group_info[group_order] == "C2", drop = FALSE]),
+    P_value = p_values,
+    stringsAsFactors = FALSE
+  )
+  
+  # Add status and fold change
+  result_df$Status <- ifelse(result_df$C1_mean > result_df$C2_mean, 
+                           "Higher in C1", "Higher in C2")
+  result_df$Fold_change <- result_df$C1_mean - result_df$C2_mean
+  
+  # Sort by p-value
+  result_df <- result_df[order(result_df$P_value), ]
+  
+  # Save results
+  write.csv(result_df, file.path(output_dir, "immune_cells_differential.csv"), row.names = FALSE)
+  
+  return(list(heatmap = p, differential = result_df))
+}
+
+# Generate immune cell boxplots
+generate_immune_boxplots <- function(tme_data, cluster_path, output_dir = "results") {
+  # Load cluster data
+  cluster_data <- read.delim(cluster_path, header = TRUE, stringsAsFactors = FALSE)
+  
+  # Extract subset of cluster data
+  cluster_data_subset <- cluster_data[, c("ID", "Group")]
+  
+  # Find common samples
+  common_samples <- intersect(cluster_data_subset$ID, colnames(tme_data))
+  
+  # Filter data
+  cluster_data_subset <- cluster_data_subset[cluster_data_subset$ID %in% common_samples, ]
+  tme_data_subset <- tme_data[, colnames(tme_data) %in% common_samples]
+  
+  # Extract row names
+  row_names <- rownames(tme_data_subset)
+  
+  # Calculate p-values
+  p_values <- apply(tme_data_subset, 1, function(row) {
+    kruskal.test(row ~ cluster_data_subset$Group)$p.value
+  })
+  
+  # Generate boxplots
+  boxplot_dir <- file.path(output_dir, "immune_boxplots")
+  dir.create(boxplot_dir, showWarnings = FALSE)
+  
+  for (i in seq_along(row_names)) {
+    row_name <- row_names[i]
+    p_value <- p_values[i]
+    
+    # Format p-value
+    if (p_value < 0.0001) {
+      formatted_p_value <- "P<0.0001"
+    } else {
+      formatted_p_value <- paste0("P=", format(p_value, digits = 4, scientific = FALSE))
+    }
+    
+    # Extract data
+    row_data <- tme_data_subset[row_name, ]
+    row_data_long <- data.frame(
+      Sample = names(row_data), 
+      Value = as.numeric(row_data)
+    )
+    row_data_long$Group <- cluster_data_subset$Group[match(row_data_long$Sample, cluster_data_subset$ID)]
+    
+    # Generate plot
+    plot <- ggplot(data = row_data_long, aes(x = Group, y = Value, fill = Group)) +
+      scale_fill_manual(values = c("#4DBBD5FF", "#E64B35FF")) +
+      geom_violin(alpha = 0.4, position = position_dodge(width = .75), size = 0.8, color = "black") +
+      geom_boxplot(notch = TRUE, outlier.size = -1, color = "black", lwd = 0.8, alpha = 0.7) +
+      geom_point(shape = 21, size = 2, position = position_jitterdodge(), color = "black", alpha = 1) +
+      theme_test() +
+      ylab(row_name) +
+      xlab("Group") +
+      ggtitle(row_name) +
+      theme(
+        axis.text.x = element_text(angle = 0, hjust = 0.5, size = 12),
+        axis.ticks = element_line(size = 0.2, color = "black"),
+        axis.ticks.length = unit(0.2, "cm"),
+        legend.position = "none",
+        axis.title = element_text(size = 15),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(hjust = 0.5)
+      ) +
+      annotate("text", x = 1.5, y = max(row_data_long$Value) * 1.1, 
+               label = formatted_p_value, size = 4)
+    
+    # Save plot
+    ggsave(file.path(boxplot_dir, paste0(row_name, ".pdf")), plot, width = 6, height = 6)
+  }
+  
+  return(p_values)
+}
+
+# Main integration function
+run_complete_analysis <- function(clinical_path, cluster_path, mrna_path, sample_list_path = NULL) {
+  # Run clinical analyses
+  clinical_results <- run_clinical_analyses(clinical_path, cluster_path)
+  
+  # Process RNA data
+  rna_data <- process_rna_data(mrna_path)
+  
+  # Calculate immune infiltration
+  immune_data <- calculate_immune_infiltration(rna_data, sample_list_path)
+  
+  # Generate immune heatmaps
+  heatmap_all <- generate_immune_heatmap(immune_data, cluster_path, 
+                                       significance_filter = FALSE)
+  
+  heatmap_significant <- generate_immune_heatmap(immune_data, cluster_path, 
+                                               significance_filter = TRUE)
+  
+  # Generate immune boxplots
+  boxplot_pvalues <- generate_immune_boxplots(immune_data, cluster_path)
+  
+  return(list(
+    clinical = clinical_results,
+    immune_data = immune_data,
+    heatmap_all = heatmap_all,
+    heatmap_significant = heatmap_significant,
+    boxplot_pvalues = boxplot_pvalues
+  ))
+}
